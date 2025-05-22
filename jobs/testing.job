@@ -1,0 +1,48 @@
+#!/bin/bash
+#SBATCH --partition=staging
+#SBATCH --job-name=CSVS2WDS_B
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=180G
+#SBATCH --time=20:40:00
+#SBATCH --output=output/success/out-%x.%A.out
+#SBATCH --error=output/error/out-%x.%A.err
+
+
+
+module purge
+module load 2023
+module load Anaconda3/2023.07-2
+
+cd $HOME/open_clip/
+
+source activate memory_clip
+
+# echo "Starting Python script testing.py"
+# python testing.py
+# SBATCH --partition=staging
+# SBATCH --job-name=DataInspect
+# SBATCH --ntasks=1
+# SBATCH --cpus-per-task=2
+# SBATCH --time=04:40:00
+# SBATCH --output=output/success/out-%x.%A.out
+# SBATCH --error=output/error/out-%x.%A.err
+
+# python convert.py
+
+# echo "Starting Python script convert_2.py"
+# python convert_2.py
+
+echo "Starting Python script convert_3.py"
+python convert_3.py   
+
+
+
+# python create_tar_indexes.py
+# SBATCH --partition=staging
+# SBATCH --job-name=CSVS2WDS
+# SBATCH --ntasks=1
+# SBATCH --cpus-per-task=2
+# SBATCH --time=02:40:00
+# SBATCH --output=output/success/out-%x.%A.out
+# SBATCH --error=output/error/out-%x.%A.err

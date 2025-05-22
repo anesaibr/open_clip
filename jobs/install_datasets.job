@@ -1,0 +1,107 @@
+#!/bin/bash
+
+#SBATCH --partition=staging
+#SBATCH --job-name=InstallDatasetsSmall
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --time=04:40:00
+#SBATCH --output=output/success/out-%x.%A.out
+#SBATCH --error=output/error/out-%x.%A.err
+
+module purge
+module load 2023
+module load Anaconda3/2023.07-2
+
+source activate memory_clip
+
+# SAM Tar to Image Mapping
+# python /home/aibrahimi/open_clip/sam_build_index.py
+
+# # --- Setup ---
+PROJECT_DIR="/projects/0/prjs1465/ShareGPT4V"
+# # SCRATCH_DIR="/scratch-shared/Sharegpt4v/"
+# # WDS_OUTPUT_BASE_DIR="${PROJECT_DIR}/wds_sharegpt4v" # Example: A specific output dir for these shards
+# # TRAIN_WDS_OUTPUT_BASE_DIR="${SCRATCH_DIR}/wds_sharegpt4v" # Example: A specific output dir for these shards
+# # TRAIN_CSV_FILE="${PROJECT_DIR}/sharegpt4v/share-captioner_coco_lcs_sam_1246k_1107_train.csv"
+# # VAL_CSV_FILE="${PROJECT_DIR}/sharegpt4v/share-captioner_coco_lcs_sam_1246k_1107_val.csv"
+PYTHON_SCRIPT_NAME="/home/aibrahimi/open_clip/csv2wds.py" # Assuming the python script is named this and is in the PROJECT_DIR or accessible via PATH
+
+# # Navigate to project directory (good practice)
+# cd "${PROJECT_DIR}" || { echo "Failed to cd to ${PROJECT_DIR}"; exit 1; }
+
+echo "Starting WebDataset conversion for TRAIN split..."
+
+# SAM Shard
+SAM_SRC=/scratch-shared/Sharegpt4v/data/sam
+SAM_DST=$TMPDIR/sam
+mkdir -p "$SAM_DST"
+rsync -avhP --ignore-existing "$SAM_SRC/" "$SAM_DST/"
+export SAM_LOCAL_DIR="$SAM_DST" # Tell Python where to find them
+
+#Debugging	
+echo "SAM_LOCAL_DIR is: $SAM_LOCAL_DIR"
+echo "Target SAM TAR part for lookup (example from SAM_LOOKUP): $SAM_LOCAL_DIR/sa_000020.tar" # Use an actual shard name
+echo "Does it exist? $(ls -l $SAM_LOCAL_DIR/sa_000020.tar 2>/dev/null || echo 'NO')"
+echo "Listing some files in SAM_LOCAL_DIR ($SAM_DST):"
+ls -lA "$SAM_DST" | head -n 10
+
+#  SPLIT A
+python "${PYTHON_SCRIPT_NAME}" \
+  --csv /projects/0/prjs1465/ShareGPT4V/sharegpt4v/small_train_A.csv \
+  --csv-has-header \
+  --split train \
+  --out-dir /scratch-shared/Sharegpt4v/wds_testing \
+  --shard-name-prefix "trainA_sharegpt4v" \
+  --img-key "filepath" \
+  --cap-key "title" \
+  --shard-size 10000 \
+  --workers $SLURM_CPUS_PER_TASK \
+
+#SPLIT B
+# python "${PYTHON_SCRIPT_NAME}" \
+#   --csv /projects/0/prjs1465/ShareGPT4V/sharegpt4v/train_B.csv \
+#   --split train \
+#   --out-dir /scratch-shared/Sharegpt4v/wds_B \
+#   --shard-name-prefix "trainB_sharegpt4v" \
+#   --img-key "filepath" \
+#   --cap-key "title" \
+#   --shard-size 10000 \
+#   --workers $SLURM_CPUS_PER_TASK \
+  # Example: larger shard size for the TRAIN split ( SAM instances: 1,138,973 + COCO 2017 instances: 236,573 + LLaVA instances: 1,116,255 = 2,491,801 samples)
+  # --tar-base and --project-prefix will use defaults from the python script, which match your paths.
+
+# echo "Finished TRAIN split conversion."
+# echo "------------------------------------"
+# echo "Starting WebDataset conversion for VAL split..."
+# python "${PYTHON_SCRIPT_NAME}" \
+#   --csv   "${VAL_CSV_FILE}" \
+#   --split val \
+#   --out-dir "${WDS_OUTPUT_BASE_DIR}" \
+#   --shard-name-prefix "val_sharegpt4v" \
+#   --img-key "filepath" \
+#   --cap-key "title" \
+#   --shard-size 1000 # Example: smaller shard size for the VAL split (2001 samples)
+#   # --tar-base and --project-prefix will use defaults from the python script.
+
+# echo "Finished VAL split conversion."
+# echo "All conversions complete."
+
+
+# # --- MSCOCO Dataset ---
+# cd /scratch-shared/mscoco/
+
+# echo "Download the MSCOCO Metadata"
+# wget https://huggingface.co/datasets/ChristophSchuhmann/MS_COCO_2017_URL_TEXT/resolve/main/mscoco.parquet
+
+
+# img2dataset \
+#   --url_list mscoco.parquet \
+#   --input_format "parquet" \
+#   --url_col "URL" \
+#   --caption_col "TEXT" \
+#   --output_format webdataset \
+#   --output_folder mscoco \
+#   --processes_count 16 \
+#   --thread_count 64 \
+#   --image_size 256 \
+#   --enable_wandb True

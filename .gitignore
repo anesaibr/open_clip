@@ -152,4 +152,11 @@ core.*
 # Allow
 !src/evaluation/misc/results_dbs/*
 
-jobs/*
+jobs/output/*
+convert.py
+csv2wds.py
+sam_build_index.py
+testing_dist.py
+testing_memory.py
+testing.py
+

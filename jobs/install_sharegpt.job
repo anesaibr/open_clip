@@ -1,0 +1,797 @@
+#!/bin/bash
+
+#SBATCH --partition=staging   
+#SBATCH --job-name=InstallShareGPT4V
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=10
+#SBATCH --time=4:40:00
+#SBATCH --output=/projects/0/prjs1465/output/success/out-%x.%A.out
+#SBATCH --error=/projects/0/prjs1465/output/error/out-%x.%A.err
+
+module purge
+module load 2023
+module load Anaconda3/2023.07-2
+
+
+source activate memory_clip
+
+# Create directory structure as specified in data.md
+DATA_DIR="/projects/0/prjs1465/ShareGPT4V/data"
+mkdir -p ${DATA_DIR}
+cd ${DATA_DIR}
+
+
+# --- Configuration ---
+# SHAREGPT4V_BASE_DIR="/projects/0/prjs1465/ShareGPT4V" 
+# PYTHON_SCRIPT_PATH="/projects/0/prjs1465/sharegpt_preprocessing.py" 
+# JSON_NAME="share-captioner_coco_lcs_sam_1246k_1107"
+# FULL_CSV_PATH="$SHAREGPT4V_BASE_DIR/${JSON_NAME}.csv"
+# VAL_CSV_PATH="$SHAREGPT4V_BASE_DIR/${JSON_NAME}_val.csv"
+# TRAIN_CSV_PATH="$SHAREGPT4V_BASE_DIR/${JSON_NAME}_train.csv"
+
+# # --- Step 1: Run Python script to generate full CSV ---
+# echo "Running Python script to convert JSON to CSV..."
+# python "$PYTHON_SCRIPT_PATH" \
+#     --data-path "$SHAREGPT4V_BASE_DIR" \
+#     --json-name "$JSON_NAME"
+
+# # Check if Python script was successful (basic check: file exists)
+# if [ ! -f "$FULL_CSV_PATH" ]; then
+#     echo "Error: Python script did not create the expected CSV file: $FULL_CSV_PATH"
+#     exit 1
+# fi
+# echo "Full CSV created: $FULL_CSV_PATH"
+
+# --- Step 2: Split the CSV file ---
+# echo "Splitting ${FULL_CSV_PATH} into validation and training sets..."
+
+# # 1. Extract header
+# head -n 1 "$FULL_CSV_PATH" > header.tmp
+# if [ $? -ne 0 ]; then echo "Error getting header"; exit 1; fi
+
+# # 2. Extract validation data (lines 2-2001)
+# head -n 2001 "$FULL_CSV_PATH" | tail -n +2 > val_data.tmp
+# if [ $? -ne 0 ]; then echo "Error getting validation data"; rm header.tmp; exit 1; fi
+
+# # 3. Extract training data (lines 2002+)
+# tail -n +2002 "$FULL_CSV_PATH" > train_data.tmp
+# if [ $? -ne 0 ]; then echo "Error getting training data"; rm header.tmp val_data.tmp; exit 1; fi
+
+# # 4. Create validation CSV
+# cat header.tmp val_data.tmp > "$VAL_CSV_PATH"
+# if [ $? -ne 0 ]; then echo "Error creating validation CSV"; rm header.tmp val_data.tmp train_data.tmp; exit 1; fi
+
+# # 5. Create training CSV
+# cat header.tmp train_data.tmp > "$TRAIN_CSV_PATH"
+# if [ $? -ne 0 ]; then echo "Error creating training CSV"; rm header.tmp val_data.tmp train_data.tmp "$VAL_CSV_PATH"; exit 1; fi
+
+# # 6. Clean up temporary files
+# rm header.tmp val_data.tmp train_data.tmp
+
+# echo "Splitting complete."
+# echo "Validation set: $VAL_CSV_PATH ($(wc -l < "$VAL_CSV_PATH") lines)"
+# echo "Training set: $TRAIN_CSV_PATH ($(wc -l < "$TRAIN_CSV_PATH") lines)"
+
+# Download the JSON files from Hugging Face
+# echo "Downloading sharegpt4v_instruct_gpt4-vision_cap100k.json (134 MB)..."
+# wget -O sharegpt4v_instruct_gpt4-vision_cap100k.json "https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/resolve/main/sharegpt4v_instruct_gpt4-vision_cap100k.json"
+
+# echo "Downloading share-captioner_coco_lcs_sam_1246k_1107.json (1.5 GB)..."
+# wget -O share-captioner_coco_lcs_sam_1246k_1107.json "https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/resolve/main/share-captioner_coco_lcs_sam_1246k_1107.json"
+
+# echo "Downloading sharegpt4v_mix665k_cap23k_coco-ap9k_lcs3k_sam9k_div2k.json (1.2 GB)..."
+# wget -O sharegpt4v_mix665k_cap23k_coco-ap9k_lcs3k_sam9k_div2k.json "https://huggingface.co/datasets/Lin-Chen/ShareGPT4V/resolve/main/sharegpt4v_mix665k_cap23k_coco-ap9k_lcs3k_sam9k_div2k.json"
+
+# echo "Download of ShareGPT4V JSON files completed."
+
+# Check if the llava images folder exists and is non-empty.
+# TARGET_DIR="${DATA_DIR}/llava/llava_pretrain/images"
+# if [ -d "${TARGET_DIR}" ] && [ "$(ls -A "${TARGET_DIR}")" ]; then
+#     echo "LLAVA images already exist in ${TARGET_DIR}. Skipping download."
+# else
+#     echo "Downloading LAION-CC-SBU-558K images..."
+#     # Create the target directory (mkdir -p is safe if it already exists)
+#     mkdir -p "${TARGET_DIR}"
+#     # Download the images zip file using the /resolve/main endpoint and following redirects (-L)
+#     wget -L -O "${DATA_DIR}/llava/llava_pretrain/images.zip" "https://huggingface.co/datasets/liuhaotian/LLaVA-Pretrain/resolve/main/images.zip"
+#     # Unzip the file into the target directory
+#     unzip "${DATA_DIR}/llava/llava_pretrain/images.zip" -d "${TARGET_DIR}"
+#     # Remove the zip file after extraction
+#     rm "${DATA_DIR}/llava/llava_pretrain/images.zip"
+#     echo "LAION-CC-SBU-558K images downloaded and extracted successfully into ${TARGET_DIR}."
+# fi
+
+
+##############################################
+# Download and extract WebData datasets
+##############################################
+# echo "Downloading WebData"
+# mkdir -p "$DATA_DIR/share_textvqa/images" \
+#          "$DATA_DIR/web-celebrity/images" \
+#          "$DATA_DIR/web-landmark/images" \
+#          "$DATA_DIR/wikiart/images"
+
+##########################################
+# Download and extract WikiArt dataset   #
+##########################################
+#--Old code---
+# # Download and unzip WikiArt images
+# echo "Downloading WikiArt dataset..."
+# wget -O "$DATA_DIR/data/wikiart/wikiart.zip" "https://drive.google.com/uc?export=download&id=1FxB2Nw-vWUcTUSI_dBpPIykb-uGYoEqV"
+# echo "Unzipping WikiArt dataset..."
+# unzip "$DATA_DIR/data/wikiart/wikiart.zip" -d "$DATA_DIR/data/wikiart/images"
+# rm "$DATA_DIR/data/wikiart/wikiart.zip"
+# --------------
+
+#---New code---
+# TARGET_WIKIART="$DATA_DIR/wikiart"
+# # Check if the images folder already exists and has content
+# if [ -d "$TARGET_WIKIART/images" ] && [ "$(ls -A "$TARGET_WIKIART/images")" ]; then
+#     echo "WikiArt images already exist in $TARGET_WIKIART/images. Skipping download."
+# else
+#     echo "Downloading WikiArt dataset..."
+#     # Create the target directory (mkdir -p is safe even if it exists)
+#     mkdir -p "$TARGET_WIKIART"
+#     # Download the zip file into the wikiart folder
+#     gdown "https://drive.google.com/uc?export=download&id=1FxB2Nw-vWUcTUSI_dBpPIykb-uGYoEqV" -O "$TARGET_WIKIART/wikiart.zip"
+#     echo "Unzipping WikiArt dataset..."
+#     # Extract the zip into the wikiart folder. The archive’s internal structure will then create the "images" folder.
+#     unzip "$TARGET_WIKIART/wikiart.zip" -d "$TARGET_WIKIART"
+#     rm "$TARGET_WIKIART/wikiart.zip"
+# fi
+
+#############################################
+# Download and extract Web-Landmark dataset 
+#############################################
+#--Old code---
+# # Download and unzip Web-Landmark images
+# echo "Downloading Web-Landmark dataset..."
+# wget -O "$DATA_DIR/data/web-landmark/web-landmark.zip" "https://drive.google.com/uc?export=download&id=1JpJkN7ZMA50xAhMx9O-rVb5yLhfGm3_o"
+# echo "Unzipping Web-Landmark dataset..."
+# unzip "$DATA_DIR/data/web-landmark/web-landmark.zip" -d "$DATA_DIR/data/web-landmark/images"
+# rm "$DATA_DIR/data/web-landmark/web-landmark.zip"
+# --------------
+
+#---New code---
+# TARGET_WEB_LANDMARK="$DATA_DIR/web-landmark/images"
+# if [ -d "$TARGET_WEB_LANDMARK" ] && [ "$(ls -A "$TARGET_WEB_LANDMARK")" ]; then
+#     echo "Web-Landmark images already exist in $TARGET_WEB_LANDMARK. Skipping download."
+# else
+#     echo "Downloading Web-Landmark dataset..."
+#     gdown "https://drive.google.com/uc?export=download&id=1JpJkN7ZMA50xAhMx9O-rVb5yLhfGm3_o" -O "$DATA_DIR/web-landmark/web-landmark.zip"
+#     echo "Unzipping Web-Landmark dataset..."
+#     unzip "$DATA_DIR/web-landmark/web-landmark.zip" -d "$TARGET_WEB_LANDMARK"
+#     rm "$DATA_DIR/web-landmark/web-landmark.zip"
+# fi
+
+
+#############################################
+# Download and extract Web-Celebrity dataset #
+#############################################
+#--Old code---
+# # Download and unzip Web-Celebrity images
+# echo "Downloading Web-Celebrity dataset..."
+# wget -O "$DATA_DIR/data/web-celebrity/web-celebrity.zip" "https://drive.google.com/uc?export=download&id=1-SB71C3j1mVg0kDDXwj2IWGEoBoRUD-J"
+# echo "Unzipping Web-Celebrity dataset..."
+# unzip "$DATA_DIR/data/web-celebrity/web-celebrity.zip" -d "$DATA_DIR/data/web-celebrity/images"
+# rm "$DATA_DIR/data/web-celebrity/web-celebrity.zip"
+#---------------
+
+#---New code---
+# TARGET_WEB_CELEBRITY="$DATA_DIR/web-celebrity/images"
+# if [ -d "$TARGET_WEB_CELEBRITY" ] && [ "$(ls -A "$TARGET_WEB_CELEBRITY")" ]; then
+#     echo "Web-Celebrity images already exist in $TARGET_WEB_CELEBRITY. Skipping download."
+# else
+#     echo "Downloading Web-Celebrity dataset..."
+#     gdown "https://drive.google.com/uc?export=download&id=1-SB71C3j1mVg0kDDXwj2IWGEoBoRUD-J" -O "$DATA_DIR/web-celebrity/web-celebrity.zip"
+#     echo "Unzipping Web-Celebrity dataset..."
+#     unzip "$DATA_DIR/web-celebrity/web-celebrity.zip" -d "$TARGET_WEB_CELEBRITY"
+#     rm "$DATA_DIR/web-celebrity/web-celebrity.zip"
+# fi
+
+
+#############################################
+# Download and extract Share_TextVQA dataset  #
+#############################################
+#--Old code---
+# # Download and unzip Share_TextVQA images
+# echo "Downloading Share_TextVQA dataset..."
+# wget -O "$DATA_DIR/data/share_textvqa/share_textvqa.zip" "https://drive.google.com/uc?export=download&id=1f4v_3e1OJtyYqam1CEp6RenCNTU5_mG2"
+# echo "Unzipping Share_TextVQA dataset..."
+# unzip "$DATA_DIR/data/share_textvqa/share_textvqa.zip" -d "$DATA_DIR/data/share_textvqa/images"
+# rm "$DATA_DIR/data/share_textvqa/share_textvqa.zip"
+# echo "All WebData datasets downloaded and extracted successfully."
+#-------------
+
+#---New code---
+# TARGET_SHARE_TEXTVQA="$DATA_DIR/share_textvqa/images"
+# if [ -d "$TARGET_SHARE_TEXTVQA" ] && [ "$(ls -A "$TARGET_SHARE_TEXTVQA")" ]; then
+#     echo "Share_TextVQA images already exist in $TARGET_SHARE_TEXTVQA. Skipping download."
+# else
+#     echo "Downloading Share_TextVQA dataset..."
+#     gdown "https://drive.google.com/uc?export=download&id=1f4v_3e1OJtyYqam1CEp6RenCNTU5_mG2" -O "$DATA_DIR/share_textvqa/share_textvqa.zip"
+#     echo "Unzipping Share_TextVQA dataset..."
+#     unzip "$DATA_DIR/share_textvqa/share_textvqa.zip" -d "$TARGET_SHARE_TEXTVQA"
+#     rm "$DATA_DIR/share_textvqa/share_textvqa.zip"
+# fi
+
+
+#########################################
+# Download and extract SAM dataset      #
+#########################################
+#--Old code---
+# echo "Downlaoding SAM images" #NOTE: Only downloading the 9K images subset for SFT
+# mkdir -p "$DATA_DIR/data/sam"
+# wget -O "$DATA_DIR/data/sam/sam.zip" "https://drive.google.com/file/d/1dKumdOKSXtV7lIXdrG7jsIK_z2vZv2gs/view" 
+# unzip "$DATA_DIR/data/sam/sam.zip" -d "$DATA_DIR/data/sam/images"
+# rm "$DATA_DIR/data/sam/sam.zip"
+# echo "SAM images downloaded and extracted successfully."
+#-------------
+
+#---New code---
+# Option 1: (Only the 9K images subset for SFT)
+# TARGET_SAM="$DATA_DIR/sam/images"
+# if [ -d "$TARGET_SAM" ] && [ "$(ls -A "$TARGET_SAM")" ]; then
+#     echo "SAM images already exist in $TARGET_SAM. Skipping download."
+# else
+#     echo "Downloading SAM dataset..."
+#     gdown "https://drive.google.com/uc?export=download&id=1dKumdOKSXtV7lIXdrG7jsIK_z2vZv2gs" -O "$DATA_DIR/sam/sam.zip"
+#     echo "Unzipping SAM dataset..."
+#     unzip "$DATA_DIR/sam/sam.zip" -d "$TARGET_SAM"
+#     rm "$DATA_DIR/sam/sam.zip"
+# fi
+
+
+# Option 2: (All images from the SAM dataset 000000~000050.tar)
+# -----Tarring the SAM dataset-----
+FINAL_DEST_DIR="/scratch-shared/Sharegpt4v/data"
+# SAM_DEST_DIR: Specific directory for these SAM tar files
+SAM_DEST_DIR="$FINAL_DEST_DIR/sam"
+# URL of the text file containing the links
+LINKS_URL="https://scontent-ams2-1.xx.fbcdn.net/m1/v/t6/An8MNcSV8eixKBYJ2kyw6sfPh-J9U4tH2BV7uPzibNa0pu4uHi6fyXdlbADVO4nfvsWpTwR8B0usCARHTz33cBQNrC0kWZsD1MbBWjw.txt?_nc_gid=pI-S5TcQe8sDlq4tDVskYA&_nc_oc=Adm_uvrcd_DpoevbZVvlwWiSEOiCbvtlwjMVs_NnnNQfJCCVUSvc6BnzTi5vSR0eMAk&ccb=10-5&oh=00_AfLqwEu3PuaFh8MsXnRSHUruaN7CfaP7fSOIVIZP3w6EKA&oe=684AB218&_nc_sid=0fdd51"
+# Temporary file to store the links
+LINKS_FILE="sam_links_temp.txt"
+
+# Range limits
+MIN_INDEX=0
+MAX_INDEX=50
+
+# Check if TMPDIR is set (though we might not need it heavily here)
+if [ -z "$TMPDIR" ]; then
+  echo "Warning: TMPDIR environment variable is not set, but continuing."
+  # If wget fails without it, you might need to set one manually or ensure Slurm provides it.
+fi
+
+# --- Create Final Destination Directory ---
+echo "Ensuring final SAM destination directory exists: $SAM_DEST_DIR"
+mkdir -p "$SAM_DEST_DIR"
+if [ $? -ne 0 ]; then
+    echo "Error: Could not create final destination directory $SAM_DEST_DIR. Check permissions."
+    exit 1
+fi
+
+# --- Download the links file ---
+echo "Downloading links file from $LINKS_URL ..."
+# Use -q for quiet download of the small text file
+wget -q -O "$LINKS_FILE" "$LINKS_URL"
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to download links file $LINKS_URL."
+    exit 1
+fi
+if [ ! -s "$LINKS_FILE" ]; then
+    echo "Error: Downloaded links file $LINKS_FILE is empty."
+    rm -f "$LINKS_FILE"
+    exit 1
+fi
+echo "Links file downloaded successfully to $LINKS_FILE."
+
+# --- Process Links File and Download Tar Files ---
+echo "Starting download of SAM tar files ($MIN_INDEX to $MAX_INDEX)..."
+echo "Target directory: $SAM_DEST_DIR"
+echo "------------------------------------------------------------"
+
+# Read the file, skipping the header line (tail -n +2)
+# Use tab as delimiter (IFS=$'\t')
+tail -n +2 "$LINKS_FILE" | while IFS=$'\t' read -r file_name cdn_link; do
+    # Trim potential whitespace (though unlikely with tabs)
+    file_name=$(echo "$file_name" | xargs)
+    cdn_link=$(echo "$cdn_link" | xargs)
+
+    # Check if line is empty or malformed
+    if [ -z "$file_name" ] || [ -z "$cdn_link" ]; then
+        # echo "Skipping malformed or empty line." # Optional debug
+        continue
+    fi
+
+    # Extract the numerical index from the filename (e.g., "000020" from "sa_000020.tar")
+    # Remove prefix 'sa_'
+    number_str=${file_name#sa_}
+    # Remove suffix '.tar'
+    number_str=${number_str%.tar}
+
+    # Check if it looks like a number
+    if ! [[ "$number_str" =~ ^[0-9]+$ ]]; then
+        echo "Warning: Could not extract valid number from filename '$file_name'. Skipping."
+        continue
+    fi
+
+    # Convert to integer (base 10) for comparison
+    number_int=$((10#$number_str))
+
+    # Check if the number is within the desired range
+    if [[ $number_int -ge $MIN_INDEX && $number_int -le $MAX_INDEX ]]; then
+        TARGET_FILE_PATH="$SAM_DEST_DIR/$file_name"
+        echo "--- Found target: $file_name (Index: $number_int) ---"
+
+        # Check if the target tar file already exists
+        if [ -f "$TARGET_FILE_PATH" ]; then
+            echo "File $TARGET_FILE_PATH already exists. Skipping download."
+        else
+            echo "Downloading $file_name from $cdn_link ..."
+            # Download with progress bar directly to the destination
+            wget --progress=bar:force -O "$TARGET_FILE_PATH" "$cdn_link"
+            WGET_STATUS=$?
+            if [ $WGET_STATUS -ne 0 ]; then
+                echo "Error ($WGET_STATUS) downloading $file_name. Cleaning up partial file."
+                rm -f "$TARGET_FILE_PATH" # Remove potentially partial download
+            else
+                echo "Successfully downloaded $file_name."
+            fi
+        fi
+        echo "------------------------------------------------------------"
+
+    # else # Optional: uncomment to see which files are skipped
+        # echo "Skipping $file_name (Index: $number_int) - outside range $MIN_INDEX-$MAX_INDEX."
+    fi
+done
+
+# --- Clean up links file ---
+echo "Removing temporary links file: $LINKS_FILE"
+rm -f "$LINKS_FILE"
+
+echo "SAM dataset download process finished for the specified range."
+echo "Tar files are located in: $SAM_DEST_DIR"
+#----------------------------------------------------
+# Untarring and tarring the SAM dataset
+# echo "Starting SAM tar combination (Extract & Re-Tar method)..."
+# echo "Timestamp: $(date)"
+# SOURCE_SAM_DIR="/projects/0/prjs1465/ShareGPT4V/sam"
+# FINAL_DEST_DIR="/scratch-shared/Sharegpt4v/"
+# COMBINED_TAR_PATH="${FINAL_DEST_DIR}/sam.tar" # Final combined tar file path
+
+# MIN_INDEX=0
+# MAX_INDEX=50 # Process sa_000000.tar through sa_000050.tar
+
+# # --- Prerequisite Checks ---
+# # Check TMPDIR
+# if [ -z "$TMPDIR" ]; then
+#   echo "Error: TMPDIR environment variable is not set. Cannot use local scratch."
+#   exit 1
+# fi
+# # Check if tar command exists
+# if ! command -v tar &> /dev/null; then
+#     echo "Error: tar command not found."
+#     exit 1
+# fi
+
+# # Check if final file already exists
+# if [ -f "$COMBINED_TAR_PATH" ]; then
+#     echo "Combined file $COMBINED_TAR_PATH already exists. Exiting."
+#     exit 0
+# fi
+
+# # Check if source directory exists
+# if [ ! -d "$SOURCE_SAM_DIR" ]; then
+#     echo "Error: Source directory $SOURCE_SAM_DIR not found!"
+#     exit 1
+# fi
+
+# # Define Temporary Directories
+# TMP_EXTRACT_DIR="$TMPDIR/sam_extract_all_$$"     # Where all files are initially extracted
+# TMP_STAGING_DIR="$TMPDIR/sam_final_structure_$$" # Where files are organized for final tar
+# TMP_STAGING_IMAGES_DIR="$TMP_STAGING_DIR/sam/images" # The specific target structure
+# TMP_OUTPUT_TAR="$TMPDIR/sam_combined_temp.tar.$$" # Temp location for final tar output
+
+# echo "Using temporary directory base: $TMPDIR"
+# echo "Temp extract dir: $TMP_EXTRACT_DIR"
+# echo "Temp staging dir: $TMP_STAGING_DIR"
+# echo "Temp output tar: $TMP_OUTPUT_TAR"
+
+# # Create temporary directories
+# mkdir -p "$TMP_EXTRACT_DIR" || { echo "Failed to create $TMP_EXTRACT_DIR"; exit 1; }
+# mkdir -p "$TMP_STAGING_IMAGES_DIR" || { echo "Failed to create final structure in $TMP_STAGING_IMAGES_DIR"; rm -rf "$TMP_EXTRACT_DIR"; exit 1; }
+# echo "Created temporary directories."
+
+# # --- Step 1: Extract all source tar files into one temp directory ---
+# echo "Extracting source tar files $MIN_INDEX to $MAX_INDEX into $TMP_EXTRACT_DIR..."
+# FAILED_EXTRACTION=0
+# processed_count=0
+# for i in $(seq $MIN_INDEX $MAX_INDEX); do
+#     tar_num=$(printf "sa_%06d.tar" $i)
+#     current_tar_path="$SOURCE_SAM_DIR/$tar_num"
+
+#     if [ ! -f "$current_tar_path" ]; then
+#         echo "Warning: Tar file $current_tar_path not found. Skipping extraction."
+#         continue
+#     fi
+
+#     # Extract into the temporary directory. tar should detect gzip automatically.
+#     # Add -v option to see files being extracted (can generate a LOT of output)
+#     # tar xvzf "$current_tar_path" -C "$TMP_EXTRACT_DIR" # Explicit gzip
+#     tar xf "$current_tar_path" -C "$TMP_EXTRACT_DIR" # Auto-detect compression
+#     EXTRACT_STATUS=$?
+#     if [ $EXTRACT_STATUS -ne 0 ]; then
+#         echo "Error ($EXTRACT_STATUS) extracting $current_tar_path. Stopping."
+#         FAILED_EXTRACTION=1
+#         break # Stop on first extraction error
+#     else
+#         # Simple progress indicator
+#         processed_count=$((processed_count + 1))
+#         if (( processed_count % 5 == 0 )); then
+#             echo "  Extracted $processed_count files..."
+#         fi
+#     fi
+# done
+
+# if [ $FAILED_EXTRACTION -eq 1 ]; then
+#     echo "Aborting due to extraction error."
+#     rm -rf "$TMP_EXTRACT_DIR" "$TMP_STAGING_DIR" # Clean up temp dirs
+#     exit 1
+# fi
+# echo "Finished extracting $processed_count source files."
+
+# # --- Step 2: Move extracted files into the desired final structure ---
+# # Move ONLY the .jpg and .json files (assuming that's all you need)
+# # from the flat $TMP_EXTRACT_DIR into $TMP_STAGING_IMAGES_DIR
+# echo "Moving extracted files (*.jpg, *.json) into final structure: $TMP_STAGING_IMAGES_DIR/"
+# # Use find to handle potentially large number of files safely and avoid arg list too long
+# # Using -maxdepth 1 because tar tf showed flat structure like ./sa_....jpg
+# find "$TMP_EXTRACT_DIR" -maxdepth 1 \( -name 'sa_*.jpg' -o -name 'sa_*.json' \) -print0 | xargs -0 -I {} mv {} "$TMP_STAGING_IMAGES_DIR/"
+# MOVE_STATUS=$?
+# if [ $MOVE_STATUS -ne 0 ]; then
+#      # Check if xargs reported an error (might happen if some files failed to move)
+#      # We check if the target directory is empty as a basic validation
+#      if [ -z "$(ls -A "$TMP_STAGING_IMAGES_DIR")" ]; then
+#         echo "Error ($MOVE_STATUS) moving extracted files into final structure. Target directory $TMP_STAGING_IMAGES_DIR appears empty."
+#         ls -lA "$TMP_EXTRACT_DIR" # List remaining files in source for debug
+#         rm -rf "$TMP_EXTRACT_DIR" "$TMP_STAGING_DIR"
+#         exit 1
+#      else
+#          echo "Warning ($MOVE_STATUS): Some files may not have moved correctly during staging. Continuing, but inspect final tar."
+#      fi
+# fi
+# # Verify if the staging directory contains files now
+# num_staged=$(find "$TMP_STAGING_IMAGES_DIR" -type f | wc -l)
+# echo "$num_staged files moved to staging structure."
+# if [ "$num_staged" -eq 0 ]; then
+#     echo "Error: No files were moved to the staging directory. Check extraction output."
+#     rm -rf "$TMP_EXTRACT_DIR" "$TMP_STAGING_DIR"
+#     exit 1
+# fi
+
+# # --- Step 3: Create the new combined, uncompressed tar file from the staging dir ---
+# # Output first to TMPDIR to avoid quotas during creation
+# echo "Creating final combined archive $TMP_OUTPUT_TAR from $TMP_STAGING_DIR..."
+# # Use -C to make internal paths start with 'sam/...'
+# # Archive the 'sam' directory inside the staging directory
+# tar cf "$TMP_OUTPUT_TAR" -C "$TMP_STAGING_DIR" sam
+# TAR_STATUS=$?
+
+# if [ $TAR_STATUS -ne 0 ]; then
+#     echo "Error ($TAR_STATUS) creating final combined tar file from staging directory."
+#     rm -rf "$TMP_EXTRACT_DIR" "$TMP_STAGING_DIR" "$TMP_OUTPUT_TAR"
+#     exit 1
+# fi
+# echo "Final combined tar created in TMPDIR: $TMP_OUTPUT_TAR"
+
+# # --- Step 4: Verify final tar (Crucial Check for Internal Paths) ---
+# echo "Verifying final tar archive structure (first 10 files)..."
+# # Check that paths start with 'sam/images/'
+# tar tf "$TMP_OUTPUT_TAR" | head -n 10
+# VERIFY_STATUS=$?
+# if [ $VERIFY_STATUS -ne 0 ]; then
+#     echo "Error ($VERIFY_STATUS) verifying final tar file $TMP_OUTPUT_TAR."
+#     rm -rf "$TMP_EXTRACT_DIR" "$TMP_STAGING_DIR" "$TMP_OUTPUT_TAR"
+#     exit 1
+# fi
+# # Perform a more specific check
+# if ! tar tf "$TMP_OUTPUT_TAR" | head -n 5 | grep -q '^sam/images/'; then
+#     echo "Error: Internal paths in final tar do not start with 'sam/images/'. Check staging/tar creation steps."
+#     rm -rf "$TMP_EXTRACT_DIR" "$TMP_STAGING_DIR" "$TMP_OUTPUT_TAR"
+#     exit 1
+# fi
+# echo "Final tar structure verified."
+
+# # --- Step 5: Move final tar to destination ---
+# echo "Moving $TMP_OUTPUT_TAR to $COMBINED_TAR_PATH..."
+# mv "$TMP_OUTPUT_TAR" "$COMBINED_TAR_PATH"
+# MOVE_STATUS=$?
+# if [ $MOVE_STATUS -ne 0 ]; then
+#      echo "Error ($MOVE_STATUS) moving final tar to $COMBINED_TAR_PATH."
+#      echo "Archive remains in $TMP_OUTPUT_TAR (will be deleted at job end if on node-local /tmp)."
+#      # Clean up extract dirs anyway
+#      rm -rf "$TMP_EXTRACT_DIR" "$TMP_STAGING_DIR"
+#      exit 1
+# fi
+# echo "Successfully moved final tar to $COMBINED_TAR_PATH."
+
+# # --- Step 6: Cleanup ---
+# echo "Cleaning up temporary directories from $TMPDIR..."
+# rm -rf "$TMP_EXTRACT_DIR"
+# rm -rf "$TMP_STAGING_DIR"
+# echo "Cleanup complete."
+
+# echo "SAM tar combination process (Extract & Re-Tar) finished."
+# echo "Timestamp: $(date)"
+# echo "Combined archive: $COMBINED_TAR_PATH"
+# echo "You may now want to delete the original files in $SOURCE_SAM_DIR if space is needed and the combined tar is confirmed good."
+
+
+
+#########################################
+# Download and extract GQA dataset      #
+#########################################
+# GQA_OUTER_IMAGES="$DATA_DIR/gqa/images"
+# GQA_INNER_IMAGES="$GQA_OUTER_IMAGES/images"
+
+# echo "Checking GQA directory structure..."
+
+# # Check if the problematic inner directory exists
+# if [ -d "$GQA_INNER_IMAGES" ]; then
+#   echo "Found nested directory: $GQA_INNER_IMAGES"
+#   echo "Moving contents from $GQA_INNER_IMAGES to $GQA_OUTER_IMAGES ..."
+
+#   # Move everything (including hidden files if any) from the inner dir to the outer dir
+#   # The trailing slash on the source is important for 'mv *'
+# #   mv "$GQA_INNER_IMAGES"/* "$GQA_OUTER_IMAGES/"
+#    echo "Moving files using rsync..."
+#    # IMPORTANT: Note the trailing slash on the source directory!
+#    rsync -av --remove-source-files "$GQA_INNER_IMAGES/" "$GQA_OUTER_IMAGES/"
+#    if [ $? -ne 0 ]; then
+#         echo "Error moving files using rsync. Manual inspection required."
+#         exit 1
+#    fi
+#    echo "File move completed."
+
+
+
+#   # Check if the inner directory is now empty before removing
+#   if [ -z "$(ls -A "$GQA_INNER_IMAGES")" ]; then
+#     echo "Removing empty inner directory: $GQA_INNER_IMAGES"
+#     rmdir "$GQA_INNER_IMAGES"
+#     echo "GQA directory structure corrected."
+#   else
+#     echo "Error: Could not empty $GQA_INNER_IMAGES. Manual inspection required."
+#     exit 1
+#   fi
+# else
+#   echo "GQA directory structure seems correct ($GQA_INNER_IMAGES not found). No fix needed."
+# fi
+
+# echo "GQA check complete."
+
+
+
+##########################################
+# Download and extract OCR-VQA dataset     #
+##########################################
+
+#---Old code---
+# echo "Downloading OCR-VQA"
+# mkdir -p "$DATA_DIR/ocr_vqa"
+# cd "$DATA_DIR/ocr_vqa"
+# gdown --folder "https://drive.google.com/drive/folders/1_GYPY5UkUy7HIcR0zq3ZCFgeZN7BAfm_"
+# python loadDataset.py
+#--------------
+
+#---New code----
+
+# FINAL_DEST_DIR="/scratch-shared/Sharegpt4v/data"
+# OCRVQA_TAR_PATH="$FINAL_DEST_DIR/ocr_vqa.tar" # Final destination for the tar file
+# ZIP_FILE_URL="https://huggingface.co/datasets/weizhiwang/llava_v15_instruction_images/resolve/main/ocr_vqa_images_llava_v15.zip?download=true"
+
+# # Check if TMPDIR is set
+# if [ -z "$TMPDIR" ]; then
+#   echo "Error: TMPDIR environment variable is not set."
+#   exit 1
+# fi
+# # Check if unzip command exists
+# if ! command -v unzip &> /dev/null; then
+#     echo "Error: unzip command not found."
+#     exit 1
+# fi
+
+# # Define temporary paths within TMPDIR
+# TMP_ZIP_PATH="$TMPDIR/ocr_vqa_download.zip.$$"
+# TMP_EXTRACT_BASE_DIR="$TMPDIR/ocr_vqa_extract.$$"
+# TMP_EXTRACTED_IMAGES_DIR="$TMP_EXTRACT_BASE_DIR/images" # Expected path after unzip
+# TMP_TAR_PATH="$TMPDIR/ocr_vqa_temp.tar.$$"           # Temp location for the *new* tar file
+
+# echo "Using temporary directory base: $TMPDIR"
+# echo "Temporary Zip Path: $TMP_ZIP_PATH"
+# echo "Temporary Extract Dir: $TMP_EXTRACT_BASE_DIR"
+# echo "Temporary Tar Path: $TMP_TAR_PATH"
+# echo "Final Tar Path: $OCRVQA_TAR_PATH"
+
+# # --- Create Final Destination Directory ---
+# echo "Ensuring final destination directory exists: $FINAL_DEST_DIR"
+# mkdir -p "$FINAL_DEST_DIR" || { echo "Failed to create $FINAL_DEST_DIR"; exit 1; }
+
+# # --- Check if final tar already exists ---
+# if [ -f "$OCRVQA_TAR_PATH" ]; then
+#     echo "Final target file $OCRVQA_TAR_PATH already exists. Skipping."
+#     exit 0
+# fi
+
+# echo "Processing OCR-VQA dataset (no progress bar)..."
+# echo "------------------------------------------------------------"
+
+# # 1. Download the zip file to TMPDIR
+# echo "Downloading OCR-VQA zip file to temporary storage..."
+# wget --progress=bar:force -O "$TMP_ZIP_PATH" "$ZIP_FILE_URL" # Keep wget progress
+# RET_CODE=$?
+# if [ $RET_CODE -ne 0 ]; then
+#     echo "Error downloading file (wget exit code: $RET_CODE)."
+#     rm -f "$TMP_ZIP_PATH"
+#     exit 1
+# fi
+# echo "Download complete."
+
+# # 2. Create temporary extraction directory
+# mkdir -p "$TMP_EXTRACT_BASE_DIR" || { echo "Failed to create $TMP_EXTRACT_BASE_DIR"; exit 1; }
+
+# # 3. Unzip into the temporary extraction directory
+# echo "Extracting zip file into $TMP_EXTRACT_BASE_DIR ..."
+# unzip -q "$TMP_ZIP_PATH" -d "$TMP_EXTRACT_BASE_DIR" # Use -q for quiet unzip
+# RET_CODE=$?
+# if [ $RET_CODE -ne 0 ]; then
+#     echo "Error unzipping file $TMP_ZIP_PATH (unzip exit code: $RET_CODE)."
+#     rm -f "$TMP_ZIP_PATH"
+#     rm -rf "$TMP_EXTRACT_BASE_DIR"
+#     exit 1
+# fi
+# echo "Extraction complete."
+
+# # 4. Verify extraction created the 'images' directory
+# if [ ! -d "$TMP_EXTRACTED_IMAGES_DIR" ]; then
+#     echo "Error: Expected directory $TMP_EXTRACTED_IMAGES_DIR not found after unzip."
+#     ls -lA "$TMP_EXTRACT_BASE_DIR" # List contents for debugging
+#     rm -f "$TMP_ZIP_PATH"
+#     rm -rf "$TMP_EXTRACT_BASE_DIR"
+#     exit 1
+# fi
+# echo "Verified extracted directory structure."
+
+# # 5. Create TAR archive in TMPDIR from the extracted files (Direct Method)
+# echo "Creating temporary TAR archive $TMP_TAR_PATH..."
+# # --- Direct tar cf command ---
+# tar cf "$TMP_TAR_PATH" -C "$TMP_EXTRACT_BASE_DIR" images
+# TAR_STATUS=$? # Capture tar exit status
+
+# if [ $TAR_STATUS -ne 0 ]; then
+#     echo "Error ($TAR_STATUS) during tar creation for OCR-VQA."
+#     rm -f "$TMP_TAR_PATH" # Clean up potentially incomplete tar
+#     # Clean up other temp files as well
+#     rm -f "$TMP_ZIP_PATH"
+#     rm -rf "$TMP_EXTRACT_BASE_DIR"
+#     exit 1
+# fi
+# echo "Temporary tar archive created successfully."
+
+# # 6. Verify the new TAR archive in TMPDIR
+# echo "Verifying temporary tar archive $TMP_TAR_PATH ..."
+# tar tf "$TMP_TAR_PATH" > /dev/null
+# VERIFY_STATUS=$?
+# if [ $VERIFY_STATUS -ne 0 ]; then
+#     echo "Error ($VERIFY_STATUS) verifying temporary tar archive $TMP_TAR_PATH."
+#     rm -f "$TMP_TAR_PATH"
+#     rm -f "$TMP_ZIP_PATH"
+#     rm -rf "$TMP_EXTRACT_BASE_DIR"
+#     exit 1
+# fi
+# echo "Temporary tar archive verified successfully."
+
+# # 7. Move the verified archive from TMPDIR to final destination
+# echo "Moving verified archive from $TMP_TAR_PATH to $OCRVQA_TAR_PATH ..."
+# mv "$TMP_TAR_PATH" "$OCRVQA_TAR_PATH"
+# MOVE_STATUS=$?
+# if [ $MOVE_STATUS -ne 0 ]; then
+#     echo "Error ($MOVE_STATUS) moving temporary tar file to $OCRVQA_TAR_PATH."
+#     echo "Check permissions and quotas on $FINAL_DEST_DIR."
+#     echo "The archive may remain in $TMP_TAR_PATH (will be deleted at job end)."
+#     rm -f "$TMP_ZIP_PATH"
+#     rm -rf "$TMP_EXTRACT_BASE_DIR"
+#     exit 1
+# fi
+# echo "Archive moved successfully to $OCRVQA_TAR_PATH."
+
+# # 8. Cleanup temporary files from TMPDIR
+# echo "Cleaning up temporary files from $TMPDIR..."
+# rm -f "$TMP_ZIP_PATH"
+# rm -rf "$TMP_EXTRACT_BASE_DIR"
+# # TMP_TAR_PATH was moved, not deleted
+
+# echo "OCR-VQA dataset processed successfully."
+# echo "Final archive is located at: $OCRVQA_TAR_PATH"
+
+
+
+
+##########################################
+# Download and extract TextVQA dataset     #
+##########################################
+#--Old code---
+# echo "TextVQA"
+# mkdir -p "$DATA_DIR/textvqa"
+# wget -O "$DATA_DIR/textvqa/textvqa.zip" "https://dl.fbaipublicfiles.com/textvqa/images/train_val_images.zip"
+# unzip "$DATA_DIR/textvqa/textvqa.zip" -d "$DATA_DIR/textvqa/train_images"
+# rm "$DATA_DIR/textvqa/textvqa.zip"
+# echo "TextVQA images downloaded and extracted successfully."
+#--------------
+
+#--- New code---
+# TARGET_TEXTVQA="$DATA_DIR/textvqa/train_images"
+# if [ -d "$TARGET_TEXTVQA" ] && [ "$(ls -A "$TARGET_TEXTVQA")" ]; then
+#     echo "TextVQA images already exist in $TARGET_TEXTVQA. Skipping download."
+# else
+#     echo "Downloading TextVQA dataset..."
+#     mkdir -p "$DATA_DIR/textvqa/train_images"
+#     wget -O "$DATA_DIR/textvqa/textvqa.zip" "https://dl.fbaipublicfiles.com/textvqa/images/train_val_images.zip"
+#     unzip "$DATA_DIR/textvqa/textvqa.zip" -d "$TARGET_TEXTVQA"
+#     rm "$DATA_DIR/textvqa/textvqa.zip"
+#     echo "TextVQA images downloaded and extracted successfully."
+# fi
+
+
+
+##########################################
+# Download and extract VisualGenome dataset
+##########################################
+
+# ---Old code---	
+# echo "Downloading VisualGenome"
+# mkdir -p "$DATA_DIR/vg" \
+#          "$DATA_DIR/vg/VG_100K" \
+#          "$DATA_DIR/vg/VG_100K_2"
+
+
+# wget -O "$DATA_DIR/vg/vg100k.zip" "https://cs.stanford.edu/people/rak248/VG_100K_2/images.zip"
+# unzip "$DATA_DIR/vg/vg100k.zip" -d "$DATA_DIR/vg/VG_100K"
+# rm "$DATA_DIR/vg/vg100k.zip"
+
+# wget -O "$DATA_DIR/vg/vg100k2.zip" "https://cs.stanford.edu/people/rak248/VG_100K_2/images2.zip"
+# unzip "$DATA_DIR/vg/vg100k2.zip" -d "$DATA_DIR/vg/VG_100K_2"
+# rm "$DATA_DIR/vg/vg100k2.zip"
+# echo "VisualGenome images downloaded and extracted successfully."
+#-------------
+
+# ---New code----
+# TARGET_VG100K="$DATA_DIR/vg/VG_100K"
+# TARGET_VG100K2="$DATA_DIR/vg/VG_100K_2"
+
+# if [ -d "$TARGET_VG100K" ] && [ "$(ls -A "$TARGET_VG100K")" ]; then
+#     echo "VisualGenome VG_100K images already exist in $TARGET_VG100K. Skipping download."
+# else
+#     echo "Downloading VisualGenome VG_100K dataset..."
+#     mkdir -p "$TARGET_VG100K"
+#     wget -O "$DATA_DIR/vg/vg100k.zip" "https://cs.stanford.edu/people/rak248/VG_100K_2/images.zip"
+#     unzip "$DATA_DIR/vg/vg100k.zip" -d "$TARGET_VG100K"
+#     rm "$DATA_DIR/vg/vg100k.zip"
+# fi
+
+# if [ -d "$TARGET_VG100K2" ] && [ "$(ls -A "$TARGET_VG100K2")" ]; then
+#     echo "VisualGenome VG_100K_2 images already exist in $TARGET_VG100K2. Skipping download."
+# else
+#     echo "Downloading VisualGenome VG_100K_2 dataset..."
+#     mkdir -p "$TARGET_VG100K2"
+#     wget -O "$DATA_DIR/vg/vg100k2.zip" "https://cs.stanford.edu/people/rak248/VG_100K_2/images2.zip"
+#     unzip "$DATA_DIR/vg/vg100k2.zip" -d "$TARGET_VG100K2"
+#     rm "$DATA_DIR/vg/vg100k2.zip"
+# fi
+# echo "VisualGenome images downloaded and extracted successfully."
+
+
+
+
+
+

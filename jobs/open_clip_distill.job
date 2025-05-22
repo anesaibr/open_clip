@@ -1,0 +1,90 @@
+#!/bin/bash
+
+#SBATCH --partition=gpu_a100            # or gpu_a100 (cpu:72)
+#SBATCH --gpus=2                        # Max GPUs per node (4)
+#SBATCH --job-name=DistillCLIP2Large
+#SBATCH --ntasks=1                      # 1 task (total)
+#SBATCH --cpus-per-task=64            # ~16-18 CPUs per GPU (64/4 -> gpu_h100 or 72/4 -> gpu_a100)
+#SBATCH --time=12:00:00         # Max allowed time (120 hours)
+#SBATCH --output=output/success/out-%x.%A.out
+#SBATCH --error=output/error/out-%x.%A.err
+
+module purge
+module load 2023
+module load Anaconda3/2023.07-2
+
+cd $HOME/open_clip/
+
+source activate memory_clip
+
+# SBATCH --mem=280G                   # 700G (gpu_h100) or 480G (gpu_a100)
+
+# export LD_LIBRARY_PATH=/home/aibrahimi/.conda/envs/memory_clip/lib/python3.11/site-packages/nvidia/nccl/lib:$LD_LIBRARY_PATH
+# ---NCCL Environment Variables---
+# export NCCL_IB_TIMEOUT=24 # Increase from default 22 to 24 for InfiniBand
+# export NCCL_DEBUG=WARN  # Not "INFO", Critical for error detection.
+# export NCCL_DEBUG_SUBSYS=COLL,GRAPH # Filters logs to collective operations and communication graphs.
+# export NCCL_LAUNCH_MODE=GROUP # Groups NCCL operations for efficiency.
+# export NCCL_ASYNC_ERROR_HANDLING=1 # Enable async error handling
+# # export NCCL_P2P_DISABLE=1
+# # export NCCL_IB_DISABLE=1
+# export NCCL_COLLNET_ENABLE=0 # Disables CollNet (collective network optimizations), which can cause hangs in some topologies.
+# export NCCL_SHM_DISABLE=1 #Disables shared memory for NCCL, forcing it to use network/sockets. Helps isolate shared memory bugs.
+#---------------------------------
+
+export TORCH_DISTRIBUTED_DEBUG=DETAIL # Detailed PyTorch distributed logs
+# export CUDA_LAUNCH_BLOCKING=1
+
+
+echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "SLURM_LOCAL_RANK: $SLURM_LOCAL_RANK"
+echo "SLURM_PROCID: $SLURM_PROCID"
+echo "WORLD_SIZE: $WORLD_SIZE"
+
+#interactive node 
+# srun --partition=gpu --gpus=1 --ntasks=1 --cpus-per-task=18 --time=01:00:00 --pty bash -i
+
+
+# salloc -w gcn59 -N 1 -n 1 -t 00:30:00 -p gpu_a100
+#You could request 2 GPUs (--gpus-per-node=2) without increasing the price.
+#--train-num-sample => total_samples=$(grep -rh "successes" mscoco/*_stats.json | awk '{sum += $2} END {print sum}')
+# --resume="/projects/0/prjs1465/logs/2025_03_25-00_51_04-model_ViT-B-16-lr_0.001-b_128-j_8-p_amp_bf16/checkpoints/epoch_1.pt" \ #FIXME: resume training from checkpoint
+# --precision amp_bf16 \
+
+# --train-data="/scratch-shared/mscoco/mscoco/{00000..00047}.tar" \
+# --val-data="/scratch-shared/mscoco/mscoco/{00048..00059}.tar"  \
+#  --dataset-type=webdataset \
+# --train-num-samples 591753 \
+# --logs="/scratch-shared/open_clip_memory" 
+
+# --train-data "/projects/0/prjs1465/ShareGPT4V/sharegpt4v/share-captioner_coco_lcs_sam_1246k_1107_train.csv" \
+# --val-data "/projects/0/prjs1465/ShareGPT4V/sharegpt4v/share-captioner_coco_lcs_sam_1246k_1107_val.csv" \
+# --dataset-type=csv \
+
+torchrun --nproc_per_node 2 -m src.open_clip_train.main_distill_memory -- \
+    --resume "/projects/0/prjs1465/logs/2025_05_21-17_54_17-distill_memory_ViT-B-16-model_ViT-B-16-lr_0.0005-b_20-j_2-p_amp_bf16-loss_cosine/checkpoints/epoch_6.pt" \
+    --save-frequency 1 \
+    --train-data="/scratch-shared/Sharegpt4v/wds_multitar_v1/{000000..000624}.tar" \
+    --val-data="/projects/0/prjs1465/ShareGPT4V/wds_sharegpt4v/val/{000000..000001}.tar"  \
+    --train-num-samples 625000 \
+    --val-num-samples 2000 \
+    --dataset-type=webdataset \
+    --use-memory \
+    --warmup 1000 \
+    --batch-size=20  \
+    --accum-freq 4 \
+    --lr=5e-4 \
+    --wd=0.1 \
+    --epochs=10 \
+    --workers=2 \
+    --grad-checkpointing \
+    --model ViT-B-16 \
+    --precision amp_bf16 \
+    --pretrained "openai" \
+    --report-to wandb \
+    --wandb-project-name "memory-open-clip" \
+    --loss-type "cosine" \
+    --logs="/projects/0/prjs1465/logs" \
+    --log-every-n-steps 100 
+
+# torchrun --nproc_per_node 4 -m testing_dist

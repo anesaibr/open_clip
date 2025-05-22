@@ -1,0 +1,167 @@
+#!/bin/bash
+
+#SBATCH --partition=staging
+#SBATCH --job-name=TarDatasets
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=08:00:00
+#SBATCH --output=output/success/tar-%x.%A.out
+#SBATCH --error=output/error/tar-%x.%A.err
+
+# --- Ensure pipefail is enabled ---
+# This makes sure the exit status reflects failures in any part of a pipeline
+# set -o pipefail
+
+
+# --- Load Modules ---
+module purge
+module load 2023
+module load Anaconda3/2023.07-2
+source activate memory_clip
+
+# --- Configuration ---
+PROJECT_DATA_DIR="/projects/0/prjs1465/ShareGPT4V/data"
+FINAL_DEST_DIR="/scratch-shared/Sharegpt4v/data"
+
+DATASETS_TO_TAR=(
+    "coco"
+    "gqa"
+    "llava"
+    "vg"
+)
+
+if [ -z "$TMPDIR" ]; then
+  echo "Error: TMPDIR environment variable is not set."
+  exit 1
+fi
+# Check if pv command exists
+# if ! command -v pv &> /dev/null; then
+#     echo "Error: pv command not found. Cannot display progress bar."
+#     # Fallback to verbose tar or exit, depending on preference
+#     # echo "Warning: pv not found, falling back to verbose tar listing."
+#     # USE_PV=false
+#     exit 1 # Exit if pv is required
+# fi
+# USE_PV=true # Uncomment this line and USE_PV=false above if you want fallback
+echo "Using temporary directory base: $TMPDIR"
+
+
+echo "Ensuring final destination directory exists: $FINAL_DEST_DIR"
+mkdir -p "$FINAL_DEST_DIR" || { echo "Failed to create $FINAL_DEST_DIR"; exit 1; }
+
+# --- Script Logic ---
+echo "Starting dataset tarring process..."
+# ... (other echoes remain the same) ...
+echo "------------------------------------------------------------"
+
+for dataset in "${DATASETS_TO_TAR[@]}"; do
+    SOURCE_DIR="$PROJECT_DATA_DIR/$dataset"
+    TARGET_TAR="$FINAL_DEST_DIR/$dataset.tar"
+    TMP_TAR_PATH="$TMPDIR/$dataset.tar.$$"
+
+    echo "--- Processing dataset: $dataset ---"
+    echo "Source Directory: $SOURCE_DIR"
+    echo "Temporary TAR Path: $TMP_TAR_PATH"
+    echo "Final TAR Path: $TARGET_TAR"
+
+    # ... (Debugging ls commands can remain or be commented out) ...
+    # echo "Debug: Checking source directory existence and permissions..."
+    # ls -ld "$SOURCE_DIR"
+    # echo "Debug: Checking source directory contents (first few items)..."
+    # ls -lA "$SOURCE_DIR" | head -n 10
+
+    if [ ! -d "$SOURCE_DIR" ]; then
+        echo "Warning: Source directory $SOURCE_DIR does not exist. Skipping."
+        continue
+    fi
+    if [ -f "$TARGET_TAR" ]; then
+        echo "Warning: Final target tar file $TARGET_TAR already exists. Skipping."
+        continue
+    fi
+
+    # --- Calculate Source Size for pv ---
+    # echo "Calculating source size for progress bar..."
+    # source_size_bytes=$(du -sb "$SOURCE_DIR" | cut -f1) # Use -b for bytes
+    # if [ -z "$source_size_bytes" ]; then
+    #     echo "Error: Could not determine size of source directory $SOURCE_DIR. Cannot show progress."
+    #     # Decide whether to continue without progress or exit
+    #     # Option 1: Exit
+    #     # exit 1
+    #     # Option 2: Fallback (requires USE_PV logic mentioned above)
+    #     # echo "Warning: Proceeding without progress bar."
+    #     # TAR_COMMAND="tar cvf '$TMP_TAR_PATH' -C '$PROJECT_DATA_DIR' '$dataset'"
+    #     # TAR_NO_PROGRESS=true
+    #     # Option 3: Skip this dataset
+    #      echo "Skipping dataset $dataset due to PV size calculation error."
+    #      continue
+    # fi
+    # echo "Estimated source size: $source_size_bytes bytes."
+
+    # ... (TMPDIR space check remains the same) ...
+    source_size_kb=$(du -sk "$SOURCE_DIR" | cut -f1)
+    tmp_avail_kb=$(df -k "$TMPDIR" | awk 'NR==2 {print $4}')
+    echo "Estimated source size: ${source_size_kb} KB"
+    echo "Available space in TMPDIR: ${tmp_avail_kb} KB"
+    if [[ "$source_size_kb" && "$tmp_avail_kb" && "$source_size_kb" -gt "$tmp_avail_kb" ]]; then
+        echo "Error: Not enough estimated space in $TMPDIR for $dataset."
+        continue
+    fi
+
+
+    echo "Creating temporary archive $TMP_TAR_PATH..."
+    # --- Simplified tar command, directly to file ---
+    tar cf "$TMP_TAR_PATH" -C "$PROJECT_DATA_DIR" "$dataset"
+    TAR_STATUS=$?
+
+    if [ $TAR_STATUS -ne 0 ]; then
+        echo "Error ($TAR_STATUS) during tar creation for $dataset."
+        rm -f "$TMP_TAR_PATH"
+        continue
+    fi
+    echo "Temporary tar archive $TMP_TAR_PATH created successfully."
+
+    # ... (rest of the script: verification, move, cleanup) ...
+    # (No changes needed below this point for this specific debug)
+
+    echo "Verifying temporary tar archive $TMP_TAR_PATH ..."
+    tar tf "$TMP_TAR_PATH" > /dev/null
+    VERIFY_STATUS=$?
+
+    if [ $VERIFY_STATUS -ne 0 ]; then
+        echo "Error ($VERIFY_STATUS) verifying temporary tar archive $TMP_TAR_PATH. Archive might be corrupt."
+        rm -f "$TMP_TAR_PATH" # Clean up corrupt temp tar file
+        echo "Cleaned up potentially corrupt temporary tar file: $TMP_TAR_PATH"
+        continue
+    fi
+    echo "Temporary tar archive verified successfully."
+
+    echo "Moving verified archive from $TMP_TAR_PATH to $TARGET_TAR ..."
+    mv "$TMP_TAR_PATH" "$TARGET_TAR"
+    MOVE_STATUS=$?
+
+    if [ $MOVE_STATUS -ne 0 ]; then
+        echo "Error ($MOVE_STATUS) moving temporary tar file $TMP_TAR_PATH to $TARGET_TAR."
+        echo "The archive remains in $TMP_TAR_PATH (will be deleted at job end)."
+        echo "The original directory $SOURCE_DIR has NOT been deleted."
+        rm -f "$TMP_TAR_PATH"
+        continue
+    fi
+    echo "Archive moved successfully to $TARGET_TAR."
+
+    echo "Removing original directory $SOURCE_DIR to free space and inodes..."
+    rm -rf "$SOURCE_DIR"
+    REMOVE_STATUS=$?
+
+    if [ $REMOVE_STATUS -ne 0 ]; then
+        echo "CRITICAL ERROR ($REMOVE_STATUS): Could not remove original directory $SOURCE_DIR! Manual cleanup needed!"
+    else
+        echo "Original directory $SOURCE_DIR removed successfully from project space."
+    fi
+
+    echo "--- Finished processing dataset: $dataset ---"
+    echo ""
+
+
+done
+
+echo "Dataset tarring process completed for the specified list."

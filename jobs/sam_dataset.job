@@ -1,0 +1,92 @@
+#!/bin/bash
+
+#SBATCH --partition=staging # Or another suitable partition
+#SBATCH --job-name=CombineSAM
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4  # Not very CPU intensive
+#SBATCH --time=04:00:00    # Adjust based on size/speed
+#SBATCH --output=output/success/combine_sam-%x.%A.out
+#SBATCH --error=output/error/combine_sam-%x.%A.err
+
+echo "Starting SAM tar combination..."
+
+# --- Configuration ---
+# Directory containing sa_000000.tar ... sa_000050.tar
+SOURCE_SAM_DIR="/projects/0/prjs1465/ShareGPT4V/sam"
+# Base directory where the final sam.tar should live
+FINAL_DEST_DIR="/projects/0/prjs1465/ShareGPT4V" 
+# Final combined tar file path
+COMBINED_TAR_PATH="${FINAL_DEST_DIR}/sam.tar"
+
+MIN_INDEX=0
+MAX_INDEX=50 # Process sa_000000.tar through sa_000050.tar
+
+# Check if final file already exists
+if [ -f "$COMBINED_TAR_PATH" ]; then
+    echo "Combined file $COMBINED_TAR_PATH already exists. Exiting."
+    exit 0
+fi
+
+# Check if source directory exists
+if [ ! -d "$SOURCE_SAM_DIR" ]; then
+    echo "Error: Source directory $SOURCE_SAM_DIR not found!"
+    exit 1
+fi
+
+# --- Step 1: Create the initial archive using the first file ---
+first_tar_num=$(printf "sa_%06d.tar" $MIN_INDEX) # Format number like 000000
+first_tar_path="$SOURCE_SAM_DIR/$first_tar_num"
+
+if [ ! -f "$first_tar_path" ]; then
+    echo "Error: First tar file $first_tar_path not found!"
+    exit 1
+fi
+
+echo "Creating initial archive $COMBINED_TAR_PATH from $first_tar_path..."
+# Simply copy the first tar file to start the combined archive
+cp "$first_tar_path" "$COMBINED_TAR_PATH"
+if [ $? -ne 0 ]; then
+    echo "Error: Failed to copy initial tar file $first_tar_path."
+    rm -f "$COMBINED_TAR_PATH" # Clean up partial file
+    exit 1
+fi
+echo "Initial archive created."
+
+# --- Step 2: Append subsequent tar files ---
+echo "Appending remaining tar files..."
+for i in $(seq $((MIN_INDEX + 1)) $MAX_INDEX); do
+    tar_num=$(printf "sa_%06d.tar" $i)
+    current_tar_path="$SOURCE_SAM_DIR/$tar_num"
+
+    if [ ! -f "$current_tar_path" ]; then
+        echo "Warning: Tar file $current_tar_path not found. Skipping."
+        continue
+    fi
+
+    echo "Appending $tar_num to $COMBINED_TAR_PATH..."
+    # Use tar -A (or --concatenate) to append the *contents* of one tar to another
+    tar -Af "$COMBINED_TAR_PATH" "$current_tar_path"
+    APPEND_STATUS=$?
+    if [ $APPEND_STATUS -ne 0 ]; then
+        echo "Error ($APPEND_STATUS) appending $current_tar_path to $COMBINED_TAR_PATH."
+        echo "Combined archive may be incomplete. Manual inspection needed."
+        # Decide whether to exit or continue
+        exit 1 # Exit on first error for safety
+    fi
+done
+echo "Finished appending files."
+
+# --- Step 3: Verify (Optional but recommended) ---
+echo "Performing basic verification (listing first few files)..."
+tar tf "$COMBINED_TAR_PATH" | head -n 10
+echo "Performing basic verification (listing last few files)..."
+tar tf "$COMBINED_TAR_PATH" | tail -n 10
+# Add a check for a specific known file if possible
+# tar tf "$COMBINED_TAR_PATH" | grep -q 'sam/images/sa_512256.jpg'
+# if [ $? -ne 0 ]; then
+#     echo "Warning: Specific test file not found in combined archive!"
+# fi
+
+echo "SAM tar combination process finished."
+echo "Combined archive: $COMBINED_TAR_PATH"
+echo "You may now want to delete the original files in $SOURCE_SAM_DIR if space is needed."
