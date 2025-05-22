@@ -1,6 +1,6 @@
 from collections import OrderedDict
 import math
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -9,6 +9,13 @@ from torch.utils.checkpoint import checkpoint
 
 from .utils import to_2tuple, feature_take_indices
 from .pos_embed import get_2d_sincos_pos_embed
+from .memory import ProductKeyArgs, HashingMemory
+
+
+def parse_pk_layers(layers_str: str) -> Set[int]:
+        if not layers_str:
+            return set()
+        return set(int(s) for s in layers_str.split(",") if len(s.strip()) > 0)
 
 
 class LayerNormFp32(nn.LayerNorm):
@@ -215,12 +222,14 @@ class ResidualAttentionBlock(nn.Module):
             self,
             d_model: int,
             n_head: int,
+            layer_idx: int, # NEW PARAMETER
             mlp_ratio: float = 4.0,
             ls_init_value: float = None,
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
             is_cross_attention: bool = False,
             batch_first: bool = True,
+            memory_args: Optional[ProductKeyArgs] = None, # NEW PARAMETER
     ):
         super().__init__()
 
@@ -231,12 +240,36 @@ class ResidualAttentionBlock(nn.Module):
             self.ln_1_kv = norm_layer(d_model)
 
         self.ln_2 = norm_layer(d_model)
-        mlp_width = int(d_model * mlp_ratio)
-        self.mlp = nn.Sequential(OrderedDict([
-            ("c_fc", nn.Linear(d_model, mlp_width)),
-            ("gelu", act_layer()),
-            ("c_proj", nn.Linear(mlp_width, d_model))
-        ]))
+
+        # Decide whether to use HashingMemory or standard MLP
+        use_memory = (
+            memory_args and
+            memory_args.is_enabled and
+            layer_idx in parse_pk_layers(memory_args.layers) # returns a set of indices. If layer_idx is in that set, we swap in HashingMemory
+        )
+        if use_memory:
+            self.mlp = HashingMemory(
+                input_dim=d_model,
+                output_dim=d_model,
+                mem_n_keys=memory_args.mem_n_keys,
+                mem_heads=memory_args.mem_heads,
+                mem_knn=memory_args.mem_knn,
+                mem_share_values=memory_args.mem_share_values,
+                mem_k_dim=memory_args.mem_k_dim,
+                mem_v_dim=memory_args.mem_v_dim,
+                swilu_projection=memory_args.swilu_projection,
+                value_fixed_lr=memory_args.value_fixed_lr,
+                mem_gated=memory_args.mem_gated,
+                peer_variant=memory_args.peer_variant,
+            )
+        else:
+            mlp_width = int(d_model * mlp_ratio)
+            self.mlp = nn.Sequential(OrderedDict([
+                ("c_fc", nn.Linear(d_model, mlp_width)),
+                ("gelu", act_layer()),
+                ("c_proj", nn.Linear(mlp_width, d_model))
+            ]))
+
         self.ls_2 = LayerScale(d_model, ls_init_value) if ls_init_value is not None else nn.Identity()
 
     def attention(
@@ -250,9 +283,16 @@ class ResidualAttentionBlock(nn.Module):
         v_x = v_x if v_x is not None else q_x
 
         attn_mask = attn_mask.to(q_x.dtype) if attn_mask is not None else None
-        return self.attn(
-            q_x, k_x, v_x, need_weights=False, attn_mask=attn_mask
-        )[0]
+        attn_out = self.attn(q_x, k_x, v_x, need_weights=False, attn_mask=attn_mask)[0]
+
+        if torch.isnan(attn_out).any():
+            print(f"[DEBUG] attention() output contains NaNs!")
+        # else:
+        #     print(f"[DEBUG] attention output stats: min={attn_out.min()}, max={attn_out.max()}, mean={attn_out.mean()}, std={attn_out.std()}")
+        # return self.attn(
+        #     q_x, k_x, v_x, need_weights=False, attn_mask=attn_mask
+        # )[0]
+        return attn_out
 
     def forward(
             self,
@@ -263,8 +303,29 @@ class ResidualAttentionBlock(nn.Module):
     ):
         k_x = self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
         v_x = self.ln_1_kv(v_x) if hasattr(self, "ln_1_kv") and v_x is not None else None
-        x = q_x + self.ls_1(self.attention(q_x=self.ln_1(q_x), k_x=k_x, v_x=v_x, attn_mask=attn_mask))
-        x = x + self.ls_2(self.mlp(self.ln_2(x)))
+
+        q_ln = self.ln_1(q_x)
+        if torch.isnan(q_ln).any():
+            print(f"[DEBUG] ln_1(q_x) has NaNs — attention input corrupted!")
+        # else:
+            # print(f"[DEBUG] ln_1(q_x) stats: min={q_ln.min()}, max={q_ln.max()}, mean={q_ln.mean()}, std={q_ln.std()}")
+
+        x = q_x + self.ls_1(self.attention(q_x=q_ln, k_x=k_x, v_x=v_x, attn_mask=attn_mask))
+        
+        # === Debug print: before ln_2 ===
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print(f"[DEBUG] x BEFORE ln_2 has NaNs/Infs at layer {getattr(self, 'layer_idx', 'unknown')}")
+            print("    x stats: min=", x.min(), "max=", x.max(), "mean=", x.mean(), "std=", x.std())
+        
+        x_ln = self.ln_2(x)
+
+        # === Debug print: after ln_2 ===
+        if torch.isnan(x_ln).any() or torch.isinf(x_ln).any():
+            print(f"[DEBUG] x AFTER ln_2 has NaNs/Infs at layer {getattr(self, 'layer_idx', 'unknown')}")
+            print("    x_ln stats: min=", x_ln.min(), "max=", x_ln.max(), "mean=", x_ln.mean(), "std=", x_ln.std())
+
+        x = x + self.ls_2(self.mlp(x_ln))
+        
         return x
 
 
@@ -429,6 +490,8 @@ class Transformer(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
             batch_first: bool = True,
+            memory_args: Optional[ProductKeyArgs] = None, # HashingMemory args
+
     ):
         super().__init__()
         self.width = width
@@ -438,15 +501,17 @@ class Transformer(nn.Module):
 
         self.resblocks = nn.ModuleList([
             ResidualAttentionBlock(
-                width,
-                heads,
-                mlp_ratio,
+                d_model=width,
+                n_head=heads,
+                layer_idx=i,
+                mlp_ratio=mlp_ratio,
                 ls_init_value=ls_init_value,
                 act_layer=act_layer,
                 norm_layer=norm_layer,
                 batch_first=batch_first,
+                memory_args=memory_args,  # NEW PARAMETER
             )
-            for _ in range(layers)
+            for i in range(layers)
         ])
 
     def get_cast_dtype(self) -> torch.dtype:
@@ -496,6 +561,14 @@ class Transformer(nn.Module):
         if not self.batch_first:
             x = x.transpose(0, 1).contiguous()    # NLD -> LND
 
+        for i, blk in enumerate(self.resblocks):
+            if torch.isnan(x).any():
+                print(f"[DEBUG] x entering Transformer block {i} has NaNs!")
+            # else:
+                # print(f"[DEBUG] x entering Transformer block {i}: min={x.min()}, max={x.max()}, mean={x.mean()}, std={x.std()}")
+            # x = blk(x)
+
+
         for r in self.resblocks:
             if self.grad_checkpointing and not torch.jit.is_scripting():
                 # TODO: handle kwargs https://github.com/pytorch/pytorch/issues/79887#issuecomment-1161758372
@@ -536,6 +609,7 @@ class VisionTransformer(nn.Module):
             act_layer: Callable = nn.GELU,
             norm_layer: Callable = LayerNorm,
             output_tokens: bool = False,
+            memory_args=None,  # <-- NEW PARAMETER
     ):
         super().__init__()
         assert pool_type in ('tok', 'avg', 'none')
@@ -583,6 +657,7 @@ class VisionTransformer(nn.Module):
             ls_init_value=ls_init_value,
             act_layer=act_layer,
             norm_layer=norm_layer,
+            memory_args=memory_args,  # <-- NEW PARAMETER
         )
 
         if attentional_pool:
@@ -823,13 +898,28 @@ class VisionTransformer(nn.Module):
         return take_indices
 
     def forward(self, x: torch.Tensor):
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("[DEBUG] VisionTransformer input x has NaNs before _embeds!")
+            print("x stats:", x.min(), x.max(), x.mean(), x.std())
+
         x = self._embeds(x)
+
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("[DEBUG] Output of _embeds() has NaNs before entering transformer!")
+            print("x after _embeds:", x.min(), x.max(), x.mean(), x.std())
+
         x = self.transformer(x)
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            print("[DEBUG] Output of transformer() has NaNs!")
+            print("x after transformer:", x.min(), x.max(), x.mean(), x.std())
+
         pooled, tokens = self._pool(x)
 
         if self.proj is not None:
             pooled = pooled @ self.proj
-
+            if torch.isnan(pooled).any() or torch.isinf(pooled).any():
+                print("[DEBUG] Output of proj contains NaNs/Infs!")
+                
         if self.output_tokens:
             return pooled, tokens
         

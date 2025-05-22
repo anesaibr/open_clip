@@ -9,9 +9,12 @@ import random
 from datetime import datetime
 from functools import partial
 
+
 import numpy as np
 import torch
 from torch import optim
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP # Import DDP
 
 try:
     import wandb
@@ -28,17 +31,17 @@ try:
 except ImportError:
     hvd = None
 
-from open_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss
+from open_clip import create_model_and_transforms, trace_model, get_tokenizer, create_loss, get_model_config
 from open_clip_train.data import get_data
 from open_clip_train.distributed import is_master, init_distributed_device, broadcast_object
 from open_clip_train.logger import setup_logging
 from open_clip_train.params import parse_args
 from open_clip_train.scheduler import cosine_lr, const_lr, const_lr_cooldown
-from open_clip_train.train import train_one_epoch, evaluate
+# from open_clip_train.train import train_one_epoch, evaluate
 from open_clip_train.file_utils import pt_load, check_exists, start_sync_process, remote_sync
-from open_clip.memory import ProductKeyArgs,HashingMemory
-from open_clip.distributed import parallelize_model, DistributedArgs,get_device_mesh
 
+from open_clip_train.train_distill import train_one_epoch, evaluate
+from open_clip.memory import ProductKeyArgs,HashingMemory
 
 LATEST_CHECKPOINT_NAME = "epoch_latest.pt"
 
@@ -69,6 +72,150 @@ def get_latest_checkpoint(path: str, remote : bool):
         return checkpoints[-1]
     return None
 
+def auto_layers_string(n_blocks, skip_first=True, step=2):
+    """
+    Generate a string like '2,4,6,8' for every 'step' layer up to n_blocks-1.
+    If skip_first=True, skip layer 0 (and 1) so we start from layer 2, for instance.
+    """
+    start = 2 if skip_first else 0
+    layer_indices = [i for i in range(start, n_blocks, step)]
+    return ",".join(str(idx) for idx in layer_indices)
+
+
+def build_memory_args_automatically(vision_blocks_count):
+    # Injecting memory every 2 layers from layer 2 onwards:
+    layers_str = auto_layers_string(vision_blocks_count, skip_first=True, step=2)
+    # Then build your normal ProductKeyArgs
+    mem_args = ProductKeyArgs(
+        is_enabled=True,
+        layers=layers_str,
+        mem_n_keys=8,  #make sure 'mem_n_keys **2 mod BLOCK_SIZE(8) == 0'
+        mem_heads=2,
+        mem_knn=4,
+        mem_k_dim=256,
+        mem_v_dim=256,  #Replacing -1 with  a power of two for v_dim , reducing from 512 to 256
+        mem_share_values=True,  #  if False ---> each layer gets its own memory table
+    )
+    return mem_args
+
+def mp_parallelize_all(model):
+        """
+        Minimal function to replicate the original logic that calls `mp_parallelize`
+        on each memory layer so it reassigns `self.values` from the global.
+        """
+        # We no longer need a mesh or distributed config
+        for name, submodule in model.named_modules(): # Instead of referencing `model.layers`, doing a submodule scan
+            if isinstance(submodule, HashingMemory): # More specific check
+                logging.debug(f"[parallelize_model] calling mp_parallelize on submodule {name}")
+                # Pass None for args not needed by the simplified mp_parallelize
+                submodule.mp_parallelize(None, None, None, torch.float32) # Or appropriate dtype
+        return model
+
+def load_weights_with_memory_layers(student_model, teacher_state_dict, memory_args):
+        """
+        Loads weights from a teacher state_dict into a student model,
+        skipping incompatible layers (like HashingMemory replacing MLP).
+
+        Args:
+            student_model (nn.Module): The student model instance (with memory layers).
+            teacher_state_dict (dict): The state dictionary from the pre-trained teacher.
+            memory_args (ProductKeyArgs): The configuration for memory layers,
+                                        needed to know which layers were replaced.
+        """
+        student_sd = student_model.state_dict()
+        new_student_sd = student_sd.copy() # Start with student's own initialized weights
+
+        # Identify layers where MLP was replaced by HashingMemory in the student
+        memory_layer_indices = set()
+        if memory_args and memory_args.is_enabled and memory_args.layers:
+            # Assuming parse_pk_layers returns the set of indices where memory is used
+            # If parse_pk_layers is not accessible here, replicate its logic or pass the indices
+            try:
+                from open_clip.transformer import parse_pk_layers # Adjust import if needed
+                memory_layer_indices = parse_pk_layers(memory_args.layers)
+            except ImportError:
+                # Basic parsing if the function isn't available directly
+                logging.warning("parse_pk_layers not found. Using basic parsing for memory_args.layers.")
+                try:
+                    if isinstance(memory_args.layers, str) and memory_args.layers.lower() != 'none':
+                        memory_layer_indices = set(map(int, memory_args.layers.split(',')))
+                    elif isinstance(memory_args.layers, (list, tuple)):
+                        memory_layer_indices = set(memory_args.layers)
+                except Exception as e:
+                    logging.error(f"Could not parse memory_args.layers: {memory_args.layers}. Error: {e}")
+                    memory_layer_indices = set() # Fallback to empty set
+
+        logging.info(f"Memory layers active at indices: {memory_layer_indices}")
+
+        loaded_count = 0
+        skipped_mlp_count = 0
+        skipped_other_count = 0
+        mismatched_shape_count = 0
+
+        for key, teacher_param in teacher_state_dict.items():
+            # Focus only on the visual part if necessary (adjust prefix if needed)
+            if not key.startswith('visual.'):
+                # If you only want to load visual weights, uncomment the next line
+                # continue
+                pass # Process all weights for now
+
+            is_mlp_key_in_memory_layer = False
+            # Check if this key belongs to an MLP block that *should have been* replaced by memory
+            # Example key: "visual.transformer.resblocks.10.mlp.c_fc.weight"
+            if '.mlp.' in key:
+                try:
+                    # Extract the layer index from the key
+                    parts = key.split('.')
+                    resblock_idx = parts.index('resblocks')
+                    layer_idx_str = parts[resblock_idx + 1]
+                    layer_idx = int(layer_idx_str)
+                    if layer_idx in memory_layer_indices:
+                        is_mlp_key_in_memory_layer = True
+                except (ValueError, IndexError, TypeError):
+                    # Handle cases where parsing fails, unlikely for valid keys
+                    pass
+
+            if is_mlp_key_in_memory_layer:
+                # This key belongs to an MLP in the teacher, but the corresponding
+                # layer in the student has HashingMemory instead. Skip loading.
+                skipped_mlp_count += 1
+                # logging.debug(f"Skipping MLP key from memory layer {layer_idx}: {key}")
+                continue
+
+            # Now, check if the key exists in the student and shapes match
+            if key in student_sd:
+                student_param = student_sd[key]
+                if teacher_param.shape == student_param.shape:
+                    new_student_sd[key] = teacher_param.clone() # Use clone to avoid aliasing
+                    loaded_count += 1
+                    # logging.debug(f"Loaded key: {key} with shape {teacher_param.shape}")
+                else:
+                    logging.warning(
+                        f"Shape mismatch for key {key}: "
+                        f"Teacher shape {teacher_param.shape}, Student shape {student_param.shape}. Skipping."
+                    )
+                    mismatched_shape_count += 1
+            else:
+                # This key exists in the teacher but not the student (should be rare if not MLP)
+                skipped_other_count += 1
+                logging.warning(f"Key {key} found in teacher but not in student (and not skipped MLP). Skipping.")
+
+
+        # Load the prepared state dictionary into the student model
+        # Using strict=True is a good check here. It ensures that all keys defined
+        # in the student model are present in `new_student_sd`. Since we started
+        # with `student_sd.copy()`, this should always pass unless something
+        # fundamental changed in the model structure unexpectedly.
+        student_model.load_state_dict(new_student_sd, strict=True)
+
+        logging.info(f"Weight loading complete.")
+        logging.info(f" Weights loaded: {loaded_count}")
+        logging.info(f" MLP weights skipped (replaced by memory): {skipped_mlp_count}")
+        logging.info(f" Other weights skipped (missing in student): {skipped_other_count}")
+        logging.info(f" Weights skipped (shape mismatch): {mismatched_shape_count}")
+        logging.info(f" Total keys in teacher: {len(teacher_state_dict)}")
+        logging.info(f" Total keys in student: {len(student_sd)}")
+
 
 def main(args):
     args = parse_args(args)
@@ -84,6 +231,7 @@ def main(args):
 
     # fully initialize distributed device environment
     device = init_distributed_device(args)
+    logging.info(f"Rank {args.rank}: Initialized device. args.distributed is set to: {args.distributed}")
 
     # get the name of the experiments
     if args.name is None:
@@ -95,11 +243,13 @@ def main(args):
             date_str = broadcast_object(args, date_str)
         args.name = '-'.join([
             date_str,
+            f"distill_memory_{model_name_safe}",
             f"model_{model_name_safe}",
             f"lr_{args.lr}",
             f"b_{args.batch_size}",
             f"j_{args.workers}",
             f"p_{args.precision}",
+            f"loss_{args.loss_type}",
         ])
 
     resume_latest = args.resume == 'latest'
@@ -203,7 +353,7 @@ def main(args):
     elif args.distributed:
         logging.info(
             f'Running in distributed mode with multiple processes. Device: {args.device}.'
-            f'Process (global: {args.rank}, local {args.local_rank}), total {args.world_size}.')
+            f'Process (Rank: {args.rank}, local {args.local_rank}), World Size: {args.world_size}.')
     else:
         logging.info(f'Running with a single process. Device {args.device}.')
 
@@ -224,25 +374,56 @@ def main(args):
         model_kwargs['init_logit_scale'] = np.log(10)  # different from CLIP
         model_kwargs['init_logit_bias'] = -10
 
-    if args.use_memory:
-        memory_args = ProductKeyArgs(
-            is_enabled=True,
-            layers="2",        # "2,5" -> memory used at layers 2 and 5 
-            mem_n_keys=8,   #make sure 'mem_n_keys **2 mod BLOCK_SIZE(8) == 0'
-            mem_heads=2,
-            mem_knn=4,
-            mem_k_dim=256,
-            mem_v_dim= 256, #Replacing -1 with  a power of two for v_dim , reducing from 512 to 256
-            mem_share_values=True,  #  if False ---> each layer gets its own memory table
-        )
-    else:
-        memory_args = None
+    ############################
+    # 1) TEACHER MODEL
+    ############################
+    logging.info(f"Rank {args.rank}: Creating teacher model {args.model}...")
     model, preprocess_train, preprocess_val = create_model_and_transforms(
+        args.model,                  
+        args.pretrained,             
+        device=device,               
+        precision=args.precision,
+        jit=args.torchscript,
+        force_quick_gelu=args.force_quick_gelu,
+        force_custom_text=args.force_custom_text,
+        force_patch_dropout=args.force_patch_dropout,
+        force_image_size=args.force_image_size,
+        image_mean=args.image_mean,
+        image_std=args.image_std,
+        image_interpolation=args.image_interpolation,
+        image_resize_mode=args.image_resize_mode,
+        aug_cfg=args.aug_cfg,
+        pretrained_image=args.pretrained_image,
+        output_dict=True,
+        memory_args=None, # crucially, NOT providing memory_args here, so it remains None.
+        **model_kwargs
+    )
+    model.to(device)
+    logging.info(f"Rank {args.rank}: Teacher model created.")
+
+    ############################
+    # 2) STUDENT MODEL
+    ############################
+    teacher_model_cfg = get_model_config(args.model)
+    vision_blocks_count = teacher_model_cfg["vision_cfg"]["layers"]
+    memory_args = None
+    if args.use_memory:
+        logging.info(f"Rank {args.rank}: Building memory arguments automatically...")
+        memory_args = build_memory_args_automatically(vision_blocks_count)
+    
+    #  --- Add HashingMemory State Reset ---
+    if args.use_memory and memory_args.mem_share_values:
+        logging.info(f"Rank {args.rank}: Resetting HashingMemory shared state...")
+        HashingMemory.reset_shared_state() # Crucial before creating student
+
+    logging.info(f"Rank {args.rank}: Creating student model {args.model} {'with' if args.use_memory else 'without'} memory...")
+
+    student_model,student_preprocess_train, student_preprocess_val = create_model_and_transforms(
         args.model,
         args.pretrained,
         precision=args.precision,
         device=device,
-        memory_args=memory_args,
+        memory_args=memory_args, # <--- This time we include the memory arguments
         jit=args.torchscript,
         force_quick_gelu=args.force_quick_gelu,
         force_custom_text=args.force_custom_text,
@@ -258,26 +439,43 @@ def main(args):
         cache_dir=args.cache_dir,
         **model_kwargs,
     )
+    logging.info(f"Rank {args.rank}: Student model created.")
 
-    # Freezing all parameters
-    for param in model.parameters():
-        param.requires_grad = False
-    
-    # Unfreezing only memory layers
-    for module in model.modules():
-        if isinstance(module, HashingMemory):
-            for param in module.parameters():
-                param.requires_grad = True
+    # If using memory, we need to load the weights from the teacher model into the student model
+    if args.use_memory:
+        logging.info(f"Rank {args.rank}: Loading teacher weights into student...")
+        teacher_state_dict = model.state_dict() # Get teacher state AFTER moving to device
+        load_weights_with_memory_layers(student_model, teacher_state_dict, memory_args)
+        logging.info(f"Rank {args.rank}: Teacher weights loaded.")
 
-    # Logging total and trainable parameter counts
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logging.info(f"Total parameters: {total_params}, Trainable parameters: {trainable_params}")
+        # Freezing all parameters
+        for param in student_model.parameters():
+            param.requires_grad = False
+        
+        # Unfreezing only memory layers
+        for module in student_model.modules():
+            if isinstance(module, HashingMemory):
+                for param in module.parameters():
+                    param.requires_grad = True # Unfreeze memory
 
-    #loggin which parameters are frozen
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            logging.info(f"Parameter '{name}' is frozen (requires_grad=False)")
+        # Logging total and trainable parameter counts
+        total_params = sum(p.numel() for p in student_model.parameters())
+        trainable_params = sum(p.numel() for p in student_model.parameters() if p.requires_grad)
+        logging.info(f"Rank {args.rank}: Student - Total params: {total_params}, Trainable (memory): {trainable_params}")
+
+    student_model.to(device)
+    logging.info(f"Rank {args.rank}: Student model moved to {device}.")
+
+    #logging which parameters are frozen
+    # for name, param in student_model.named_parameters():
+    #     if not param.requires_grad:
+    #         logging.info(f"Parameter '{name}' is frozen (requires_grad=False)")
+
+    # Applying Rank-Local Sharing via mp_parallelize_all (AFTER moving to device)
+    if args.use_memory and memory_args.mem_share_values:
+        logging.info(f"Rank {args.rank}: Applying rank-local memory sharing via mp_parallelize_all...")
+        student_model = mp_parallelize_all(student_model) # Finalizes rank-local state
+        logging.info(f"Rank {args.rank}: Rank-local sharing applied.")
 
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
@@ -318,9 +516,11 @@ def main(args):
 
     if args.grad_checkpointing:
         model.set_grad_checkpointing()
+        student_model.set_grad_checkpointing()
 
     if is_master(args):
         logging.info("Model:")
+        logging.info(f"{str(student_model)}")
         logging.info(f"{str(model)}")
         logging.info("Params:")
         params_file = os.path.join(args.logs, args.name, "params.txt")
@@ -330,19 +530,48 @@ def main(args):
                 logging.info(f"  {name}: {val}")
                 f.write(f"{name}: {val}\n")
 
+
+    # --- DDP Synchronization ---
     if args.distributed and not args.horovod:
+        logging.info(f"Rank {args.rank}: Starting state_dict synchronization...")
+        dist.barrier() # Wait for all ranks to reach this point (model created, moved, rank-local sharing done)
+
+        # Use a list container; rank 0 puts state, others put placeholder
+        sync_list = [student_model.state_dict() if args.rank == 0 else {}]
+        dist.broadcast_object_list(sync_list, src=0) # Broadcast from rank 0
+
+        if args.rank != 0:
+            logging.info(f"Rank {args.rank}: Receiving and loading synchronized model state...")
+            student_model.load_state_dict(sync_list[0]) # Load the state received from rank 0
+            logging.info(f"Rank {args.rank}: State loaded.")
+        else:
+            logging.info("Rank 0: Broadcast complete.")
+
+        dist.barrier() # Wait for all ranks to finish loading
+        logging.info(f"Rank {args.rank}: State synchronization complete.")
+    # --- End DDP Synchronization ---
+
+    #  --- DDP Wrapping --- 
+    # Wrap models with DDP *after* synchronization
+    if args.distributed and not args.horovod:
+        logging.info(f"Rank {args.rank}: Wrapping models with DDP...")
         if args.use_bn_sync:
+            logging.info(f"Rank {args.rank}: Applying SyncBatchNorm...")
             model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+            student_model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(student_model)
         ddp_args = {}
         if args.ddp_static_graph:
             # this doesn't exist in older PyTorch, arg only added if enabled
             ddp_args['static_graph'] = True
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
+        student_model = torch.nn.parallel.DistributedDataParallel(student_model, device_ids=[device], **ddp_args)
     
         if args.distill:
             dist_model = torch.nn.parallel.DistributedDataParallel(dist_model, device_ids=[device], **ddp_args)
+        logging.info(f"Rank {args.rank}: DDP wrapping complete.")
+    #  --- End DDP Wrapping --- 
 
-    # # create distributed_args
+    # ----- create distributed_args via Memory Logic/META paper IF FSDP enabled ----
     # distributed_args = DistributedArgs()
     # distributed_args.dp_shard = 4        # shard across 4 GPUs
     # distributed_args.dp_replicate = 1    # only 1 node
@@ -359,7 +588,6 @@ def main(args):
     # # Define param_dtype or retrieve from your config
     # param_dtype = torch.float16 if args.precision == 'fp16' else torch.float32
 
-    # # Call the parallelize_model function
     # model = parallelize_model(
     #     model,
     #     device_mesh,
@@ -368,25 +596,12 @@ def main(args):
     #     fsdp_grouping_plan=None,  # or pass if needed
     # )
 
-    def mp_parallelize_all(model):
-        """
-        Minimal function to replicate the original logic that calls `mp_parallelize`
-        on each memory layer so it reassigns `self.values` from the global.
-        """
-        # We no longer need a mesh or distributed config
-        for name, submodule in model.named_modules(): # Instead of referencing `model.layers`, doing a submodule scan
-            if hasattr(submodule, "mp_parallelize"):
-                print(f"[parallelize_model] calling mp_parallelize on submodule {name}")
-                submodule.mp_parallelize(None, None, None, torch.float32)
-        return model
-
-    model = mp_parallelize_all(model)
-
     # # Log GPU memory usage immediately after parallelization
     # for i in range(torch.cuda.device_count()):
     #     allocated = torch.cuda.memory_allocated(i) / 1e9
     #     reserved = torch.cuda.memory_reserved(i) / 1e9
     #     logging.info(f"After parallelization - GPU {i} - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+    #--------------------------
     
     # create optimizer and scaler
     optimizer = None
@@ -394,6 +609,11 @@ def main(args):
 
     if args.train_data or args.dataset_type == "synthetic":
         assert not args.trace, 'Cannot train with traced model'
+
+        # Create optimizer using the potentially DDP-wrapped student_model.parameters()
+        # Filter parameters to only include those with requires_grad=True
+        trainable_params = [p for p in student_model.parameters() if p.requires_grad]
+        logging.info(f"Rank {args.rank}: Creating optimizer for {len(trainable_params)} trainable parameters.")
 
         opt = getattr(args, 'opt', 'adamw').lower()
         if opt.startswith('timm/'):
@@ -419,9 +639,13 @@ def main(args):
             exclude = lambda n, p: p.ndim < 2 or "bn" in n or "ln" in n or "bias" in n or 'logit_scale' in n
             include = lambda n, p: not exclude(n, p)
 
-            named_parameters = list(model.named_parameters())
-            gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
-            rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
+            # named_parameters = list(model.named_parameters())
+            # gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
+            # rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
+
+            named_trainable_parameters = [(n,p) for n, p in student_model.named_parameters() if p.requires_grad] # Use wrapped model
+            gain_or_bias_params = [p for n, p in named_trainable_parameters if exclude(n, p)]
+            rest_params = [p for n, p in named_trainable_parameters if include(n, p)]
 
             if opt == 'adamw':
                 optimizer = optim.AdamW(
@@ -466,10 +690,30 @@ def main(args):
         if 'epoch' in checkpoint:
             # resuming a train checkpoint w/ epoch and optimizer state
             start_epoch = checkpoint["epoch"]
-            sd = checkpoint["state_dict"]
-            if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
-                sd = {k[len('module.'):]: v for k, v in sd.items()}
-            model.load_state_dict(sd)
+            student_sd = checkpoint["state_dict"]
+            is_student_ddp = hasattr(student_model, 'module') # Check if student_model is already wrapped in DDP at this point
+            has_module_prefix = all(k.startswith('module.') for k in student_sd.keys()) # Check if state_dict keys have the prefix
+            
+            if is_student_ddp and not has_module_prefix:
+                # If model is DDP but checkpoint isn't, add prefix
+                student_sd = {'module.' + k: v for k, v in student_sd.items()}
+                logging.info("Added 'module.' prefix to student state_dict keys for DDP loading.")
+
+            elif not args.distributed and next(iter(student_sd.items()))[0].startswith('module'):
+                student_sd = {k[len('module.'):]: v for k, v in student_sd.items()}
+                logging.info("Removed 'module.' prefix from student state_dict keys for non-DDP loading.")
+
+            # model.load_state_dict(sd)
+            
+            # Load the state into the student model instance
+            try:
+                student_model.load_state_dict(student_sd, strict=True)
+                logging.info(f"Successfully loaded state_dict into student_model.")
+            except RuntimeError as e:
+                logging.error(f"Error loading student state_dict: {e}")
+                logging.error("This might indicate a mismatch between the current student model definition and the one saved in the checkpoint.")
+                raise e # Re-raise the error after logging
+
             if optimizer is not None:
                 optimizer.load_state_dict(checkpoint["optimizer"])
             if scaler is not None and 'scaler' in checkpoint:
@@ -484,7 +728,7 @@ def main(args):
     tokenizer = get_tokenizer(args.model, cache_dir=args.cache_dir)
     data = get_data(
         args,
-        (preprocess_train, preprocess_val),
+        (preprocess_train, preprocess_val), # Use teacher preprocess? TODO:Check consistency
         epoch=start_epoch,
         tokenizer=tokenizer,
     )
@@ -563,22 +807,27 @@ def main(args):
 
     loss = create_loss(args)
 
+    logging.info(f"Rank {args.rank}: Starting training loop from epoch {start_epoch}...")
     for epoch in range(start_epoch, args.epochs):
         if is_master(args):
             logging.info(f'Start epoch {epoch}')
 
-        train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
+        # train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
+        train_one_epoch(model,student_model,data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
         completed_epoch = epoch + 1
 
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
-            evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+            # evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+            evaluate(model,student_model,data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+
 
         # Saving checkpoints.
         if args.save_logs:
             checkpoint_dict = {
                 "epoch": completed_epoch,
                 "name": args.name,
-                "state_dict": original_model.state_dict(),
+                # "state_dict": original_model.state_dict(),
+                "state_dict": student_model.state_dict(),
                 "optimizer": optimizer.state_dict(),
             }
             if scaler is not None:
@@ -619,6 +868,15 @@ def main(args):
             logging.info('Final remote sync successful.')
         else:
             logging.info('Final remote sync failed.')
+    
+    # Final cleanup: destroy process group (safe shutdown)
+    if torch.distributed.is_initialized():
+        logging.info(f"Rank {args.rank}: Waiting at final barrier before destroying process group...")
+        torch.distributed.barrier()  # <-- required for safe shutdown!
+        logging.info(f"Rank {args.rank}: Destroying process group...")
+        torch.distributed.destroy_process_group()
+        logging.info("Destroyed distributed process group successfully.")
+
     
 
 def copy_codebase(args):

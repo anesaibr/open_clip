@@ -1,4 +1,5 @@
 from typing import Optional
+import logging
 
 import torch
 import torch.nn as nn
@@ -28,6 +29,9 @@ def gather_features(
         use_horovod=False
 ):
     assert has_distributed, 'torch.distributed did not import correctly, please use a PyTorch version with support.'
+    # Log initial tensor shapes and devices
+    # logging.info(f"Rank {dist.get_rank()} - Before gather: image_features shape {image_features.shape} on {image_features.device}")
+    # logging.info(f"Rank {dist.get_rank()} - Before gather: text_features shape {text_features.shape} on {text_features.device}")
     if use_horovod:
         assert hvd is not None, 'Please install horovod'
         if gather_with_grad:
@@ -53,15 +57,23 @@ def gather_features(
         else:
             gathered_image_features = [torch.zeros_like(image_features) for _ in range(world_size)]
             gathered_text_features = [torch.zeros_like(text_features) for _ in range(world_size)]
+            # logging.info(f"Rank {dist.get_rank()} - Allocated placeholders with shape {gathered_image_features[0].shape}")
+            # dist.barrier()  # Sync before gathering
             dist.all_gather(gathered_image_features, image_features)
             dist.all_gather(gathered_text_features, text_features)
+            # dist.barrier()  # Sync after gathering
+            # logging.info(f"Rank {dist.get_rank()} - After all_gather: gathered_image_features[0] shape: {gathered_image_features[0].shape}")
             if not local_loss:
                 # ensure grads for local rank when all_* features don't have a gradient
                 gathered_image_features[rank] = image_features
                 gathered_text_features[rank] = text_features
+
             all_image_features = torch.cat(gathered_image_features, dim=0)
             all_text_features = torch.cat(gathered_text_features, dim=0)
 
+            # del gathered_image_features, gathered_text_features  # Explicit cleanup
+            # torch.cuda.empty_cache()  # Force cleanup of unused tensors
+            # logging.info(f"Rank {dist.get_rank()} - Final gathered features shape: image_features {all_image_features.shape}, text_features {all_text_features.shape}")
     return all_image_features, all_text_features
 
 

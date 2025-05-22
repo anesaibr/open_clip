@@ -66,6 +66,12 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     autocast = get_autocast(args.precision, device_type=device.type)
     input_dtype = get_input_dtype(args.precision)
 
+    # Monitor GPU memory usage at the start of the epoch
+    for i in range(torch.cuda.device_count()):
+        allocated = torch.cuda.memory_allocated(i) / 1e9
+        reserved = torch.cuda.memory_reserved(i) / 1e9
+        logging.info(f"Epoch {epoch} start - GPU {i} - Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+
     model.train()
     if args.distill:
         dist_model.eval()
@@ -109,7 +115,27 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 total_loss = sum(losses.values())
                 losses["loss"] = total_loss
 
+            # Logging memory after forward pass (Rank 0 only)
+            if args.rank == 0 and i % 10 == 0:  # Log every 10 batches
+                allocated = torch.cuda.memory_allocated() / 1e9
+                reserved = torch.cuda.memory_reserved() / 1e9
+                logging.info(
+                    f"Rank 0 - Batch {i}: "
+                    f"Allocated: {allocated:.2f}GB, "
+                    f"Reserved: {reserved:.2f}GB"
+                )
+
             backward(total_loss, scaler)
+
+            # Log memory after backward (Rank 0 only)
+            if args.rank == 0 and i % 10 == 0:
+                allocated = torch.cuda.memory_allocated() / 1e9
+                reserved = torch.cuda.memory_reserved() / 1e9
+                logging.info(
+                    f"Rank 0 - Post-Backward {i}: "
+                    f"Allocated: {allocated:.2f}GB, "
+                    f"Reserved: {reserved:.2f}GB"
+                )
         else:
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
@@ -297,7 +323,7 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                         F.cross_entropy(logits_per_text, labels)
                     ) / 2
 
-                    gen_loss = maybe_compute_generative_loss(model_out)
+                gen_loss = maybe_compute_generative_loss(model_out)
 
                 cumulative_loss += total_loss * batch_size
                 num_samples += batch_size

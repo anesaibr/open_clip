@@ -177,7 +177,7 @@ def load_state_dict(
 def load_checkpoint(
         model: Union[CLIP, CustomTextCLIP],
         checkpoint_path: str,
-        strict: bool = True,
+        strict: bool = False, # FIXME: strict=True is not supported
         weights_only: bool = True,
         device='cpu',
 ):
@@ -226,6 +226,7 @@ def create_model(
         pretrained: Optional[str] = None,
         precision: str = 'fp32',
         device: Union[str, torch.device] = 'cpu',
+        memory_args=None,  # <--- NEW Memory PARAM
         jit: bool = False,
         force_quick_gelu: bool = False,
         force_custom_text: bool = False,
@@ -343,6 +344,16 @@ def create_model(
     custom_text = model_cfg.pop('custom_text', False) or force_custom_text or is_hf_model
 
     model_cfg = dict(model_cfg, **model_kwargs)  # merge cfg dict w/ kwargs (kwargs overrides cfg)
+    # After reading / building `model_cfg`, we inject memory_args into the config if present:
+    if memory_args is not None:
+        model_cfg["vision_cfg"]["memory_args"] = memory_args  # Add to vision config
+        
+    # Remove memory_args from top-level model_cfg to avoid passing to CLIP.__init__()
+    if "memory_args" in model_cfg:
+        del model_cfg["memory_args"]
+    
+    # Config Debug print
+    print("DEBUG: final model_cfg =>", model_cfg)
     if custom_text:
         if "multimodal_cfg" in model_cfg:
             model = CoCa(**model_cfg, cast_dtype=cast_dtype)
@@ -474,6 +485,7 @@ def create_model_and_transforms(
         pretrained: Optional[str] = None,
         precision: str = 'fp32',
         device: Union[str, torch.device] = 'cpu',
+        memory_args=None,  # <--- NEW Memory PARAM
         jit: bool = False,
         force_quick_gelu: bool = False,
         force_custom_text: bool = False,
@@ -504,6 +516,7 @@ def create_model_and_transforms(
         pretrained,
         precision=precision,
         device=device,
+        memory_args=memory_args, # <--- NEW Memory PARAM
         jit=jit,
         force_quick_gelu=force_quick_gelu,
         force_custom_text=force_custom_text,

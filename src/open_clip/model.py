@@ -32,6 +32,8 @@ class CLIPVisionCfg:
     patch_size: int = 16
     image_size: Union[Tuple[int, int], int] = 224
 
+    memory_args: Optional[Any] = None # NEW: ProductKeyArgs for memory layers
+
     ls_init_value: Optional[float] = None  # layer scale initial value
     patch_dropout: float = 0.  # what fraction of patches to dropout during training (0 would mean disabled and no patches dropped) - 0.5 to 0.75 recommended in the paper for optimal results
     attentional_pool: bool = False  # whether to use attentional pooler in the last embedding layer (overrides pool_type)
@@ -166,6 +168,7 @@ def _build_vision_tower(
             output_dim=embed_dim,
             act_layer=act_layer,
             norm_layer=norm_layer,
+            memory_args=vision_cfg.memory_args, # NEW: ProductKeyArgs for memory layers
         )
 
     return visual
@@ -250,7 +253,9 @@ class CLIP(nn.Module):
         self.text_pool_type = text.pool_type
         self.register_buffer('attn_mask', text.attn_mask, persistent=False)
 
-        lshape = [1] if nonscalar_logit_scale else []
+        # lshape = [1] if nonscalar_logit_scale else []
+        # Always make it a 1D param with shape [1], removing the [] scenario
+        lshape = [1]  # ignoring `nonscalar_logit_scale`
         self.logit_scale = nn.Parameter(torch.ones(lshape) * init_logit_scale)
         if init_logit_bias is not None:
             self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)

@@ -24,6 +24,7 @@ class ParseKwargs(argparse.Action):
 
 
 def parse_args(args):
+    # print("DEBUG: params.py is loaded!")
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--train-data",
@@ -125,6 +126,13 @@ def parse_args(args):
         default=None,
         help="Optional identifier for the experiment when storing logs. Otherwise use current time.",
     )
+    parser.add_argument(
+        "--use-memory", 
+        action='store_true', 
+        default=False, 
+        help="Enable memory layers.",
+    )
+
     parser.add_argument(
         "--workers", type=int, default=4, help="Number of dataloader workers per GPU."
     )
@@ -476,8 +484,15 @@ def parse_args(args):
         help='A string to specify a specific distributed loss implementation.'
     )
 
-    args = parser.parse_args(args)
+    parser.add_argument(
+        "--loss-type", 
+        default='mse',
+        type=str,
+        help="Distillation loss: mse, l2 norm, cosine similarity"
+    )
 
+    args = parser.parse_args(args)
+    # print(f"DEBUG: --use-memory parsed as {args.use_memory}")  # Debug line
     if 'timm' not in args.opt:
         # set default opt params based on model name (only if timm optimizer not used)
         default_params = get_default_params(args.model)
