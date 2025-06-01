@@ -255,10 +255,15 @@ class CLIP(nn.Module):
 
         # lshape = [1] if nonscalar_logit_scale else []
         # Always make it a 1D param with shape [1], removing the [] scenario
-        lshape = [1]  # ignoring `nonscalar_logit_scale`
-        self.logit_scale = nn.Parameter(torch.ones(lshape) * init_logit_scale)
+        # lshape = [1]  # ignoring `nonscalar_logit_scale`
+        # self.logit_scale = nn.Parameter(torch.ones(lshape) * init_logit_scale)
+        # if init_logit_bias is not None:
+        #     self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
+        # else:
+        #     self.logit_bias = None
+        self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)
         if init_logit_bias is not None:
-            self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
+            self.logit_bias = nn.Parameter(torch.ones([]) * init_logit_bias)
         else:
             self.logit_bias = None
 

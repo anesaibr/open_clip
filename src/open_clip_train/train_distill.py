@@ -283,27 +283,27 @@ def train_one_epoch(model,student_model,data, loss, epoch, optimizer, scaler, sc
                 break
 
             
-
+        #TODO: Decide if gradient clipping should be applied to Student model instead (or as well)
         if scaler is not None:
             if args.horovod:
                 optimizer.synchronize()
                 scaler.unscale_(optimizer)
                 if args.grad_clip_norm is not None:
-                    # torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-                    torch.nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    # torch.nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip_norm, norm_type=2.0)
                 with optimizer.skip_synchronize():
                     scaler.step(optimizer)
             else:
                 if args.grad_clip_norm is not None:
                     scaler.unscale_(optimizer)
-                    # torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-                    torch.nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    # torch.nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip_norm, norm_type=2.0)
                 scaler.step(optimizer)
             scaler.update()
         else:
             if args.grad_clip_norm is not None:
-                # torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-                torch.nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                # torch.nn.utils.clip_grad_norm_(student_model.parameters(), args.grad_clip_norm, norm_type=2.0)
             optimizer.step()
 
         # reset gradient accum, if enabled
@@ -397,116 +397,116 @@ def evaluate(teacher, student,data, epoch, args, tb_writer=None, tokenizer=None)
 
         # FIXME this does not scale past small eval datasets
         # all_image_features @ all_text_features will blow up memory and compute very quickly
-        # cumulative_loss = 0.0
-        # cumulative_gen_loss = 0.0
-        # all_image_features, all_text_features = [], []
+        cumulative_loss = 0.0
+        cumulative_gen_loss = 0.0
+        all_image_features, all_text_features = [], []
 
-        all_teacher_img_feat, all_student_img_feat = [], []
-        all_student_txt_feat, all_teacher_txt_feat = [], []
-        need_teacher_text = True # Set to False if you only care about student performance + similarity
-        
-        with torch.inference_mode():
+        with torch.no_grad():
             for i, batch in enumerate(dataloader):
                 images, texts = batch
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)
                 texts = texts.to(device=device, non_blocking=True)
-                batch_size = images.shape[0]
+
                 with autocast():
                     # model_out = model(images, texts)
-                    # image_features = student_model(images)["image_features"].float()
-                    # text_features = unwrap_model(model).encode_text(texts).float()
-                    # logit_scale = unwrap_model(model).logit_scale
-                    # model_out = {"image_features": image_features, "text_features": text_features, "logit_scale": logit_scale}
-                    teacher_image_features = unwrap_model(teacher).encode_image(images, normalize=True)
-                    student_image_features = unwrap_model(student).encode_image(images, normalize=True)
-                    all_teacher_img_feat.append(teacher_image_features.cpu())
-                    all_student_img_feat.append(student_image_features.cpu())
+                    #NOTE: This is a workaround for the fact that CLIP models return a dict due to 'output_dict=True' in the student model inside 'main_distill_memory.py'.
+                    image_features = unwrap_model(student).encode_image(images).float() # or maybe : student(images)['image_features'].float()
+                    text_features = unwrap_model(teacher).encode_text(texts).float()
+                    logit_scale = unwrap_model(teacher).logit_scale
+                    model_out = {"image_features": image_features, "text_features": text_features, "logit_scale": logit_scale}
+                    
+                    # --- My Other Method ---
+                    # teacher_image_features = unwrap_model(teacher).encode_image(images, normalize=True)
+                    # student_image_features = unwrap_model(student).encode_image(images, normalize=True)
+                    # all_teacher_img_feat.append(teacher_image_features.cpu())
+                    # all_student_img_feat.append(student_image_features.cpu())
 
-                    student_text_features = unwrap_model(student).encode_text(texts, normalize=True)
-                    all_student_txt_feat.append(student_text_features.cpu())
+                    # student_text_features = unwrap_model(student).encode_text(texts, normalize=True)
+                    # all_student_txt_feat.append(student_text_features.cpu())
 
-                    if need_teacher_text:
-                        teacher_text_features = unwrap_model(teacher).encode_text(texts,normalize=True)
-                        all_teacher_txt_feat.append(teacher_text_features.cpu())
+                    # if need_teacher_text:
+                    #     teacher_text_features = unwrap_model(teacher).encode_text(texts,normalize=True)
+                    #     all_teacher_txt_feat.append(teacher_text_features.cpu())
+                    # ------------------------------------------
 
-                    # --- Removed CLIP logit and loss calculation ---
+                    # --- CLIP logit and loss calculation ---
                     # features are accumulated in CPU tensors, otherwise GPU memory exhausted quickly
                     # however, system RAM is easily exceeded and compute time becomes problematic
-                    # all_image_features.append(image_features.cpu())
-                    # all_text_features.append(text_features.cpu())
-                    # logit_scale = logit_scale.mean()
-                    # logits_per_image = logit_scale * image_features @ text_features.t()
-                    # logits_per_text = logits_per_image.t()
+                    all_image_features.append(image_features.cpu())
+                    all_text_features.append(text_features.cpu())
+                    logit_scale = logit_scale.mean()
+                    logits_per_image = logit_scale * image_features @ text_features.t()
+                    logits_per_text = logits_per_image.t()
 
-                    # batch_size = images.shape[0]
-                    # labels = torch.arange(batch_size, device=device).long()
-                    # total_loss = (
-                    #     F.cross_entropy(logits_per_image, labels) +
-                    #     F.cross_entropy(logits_per_text, labels)
-                    # ) / 2
+                    batch_size = images.shape[0]
+                    labels = torch.arange(batch_size, device=device).long()
+                    total_loss = (
+                        F.cross_entropy(logits_per_image, labels) +
+                        F.cross_entropy(logits_per_text, labels)
+                    ) / 2
 
 
-                #TODO: Decide if maybe_compute_generative_loss is still relevant.
-                # gen_loss = maybe_compute_generative_loss(model_out)
+                    #TODO: Decide if maybe_compute_generative_loss is still relevant.
+                    # gen_loss = maybe_compute_generative_loss(model_out)
 
-                # cumulative_loss += total_loss * batch_size
-                # num_samples += batch_size
-                # if is_master(args) and (i % 100) == 0:
-                #     logging.info(
-                #         f"Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t"
-                #         f"Clip Loss: {cumulative_loss / num_samples:.6f}\t")
+                cumulative_loss += total_loss * batch_size
+                num_samples += batch_size
+                if is_master(args) and (i % 100) == 0:
+                    logging.info(
+                        f"Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t"
+                        f"Clip Loss: {cumulative_loss / num_samples:.6f}\t")
 
                     # if gen_loss is not None:
                     #     cumulative_gen_loss += gen_loss * batch_size
                     #     logging.info(
                     #         f"Generative Loss: {cumulative_gen_loss / num_samples:.6f}\t")
 
-            # val_metrics = get_clip_metrics(
-            #     image_features=torch.cat(all_image_features),
-            #     text_features=torch.cat(all_text_features),
-            #     logit_scale=logit_scale.cpu(),
-            # )
-            # loss = cumulative_loss / num_samples
-            # metrics.update(
-            #     {**val_metrics, "clip_val_loss": loss.item(), "epoch": epoch, "num_samples": num_samples}
-            # )
+            val_metrics = get_clip_metrics(
+                image_features=torch.cat(all_image_features),
+                text_features=torch.cat(all_text_features),
+                logit_scale=logit_scale.cpu(),
+            )
+            loss = cumulative_loss / num_samples
+            metrics.update(
+                {**val_metrics, "clip_val_loss": loss.item(), "epoch": epoch, "num_samples": num_samples}
+            )
             # if gen_loss is not None:
             #     gen_loss = cumulative_gen_loss / num_samples
             #     metrics.update({"val_generative_loss": gen_loss.item()})
 
 
         # --- Concatenate Features ---
-        teacher_img_feat = torch.cat(all_teacher_img_feat)
-        student_img_feat = torch.cat(all_student_img_feat)
-        student_txt_feat = torch.cat(all_student_txt_feat)
-        if need_teacher_text:
-            teacher_txt_feat = torch.cat(all_teacher_txt_feat)
+        # teacher_img_feat = torch.cat(all_teacher_img_feat)
+        # student_img_feat = torch.cat(all_student_img_feat)
+        # student_txt_feat = torch.cat(all_student_txt_feat)
+        # if need_teacher_text:
+        #     teacher_txt_feat = torch.cat(all_teacher_txt_feat)
         
-        # --- 1. Image Encoder Similarity Metrics ---
-        cos = F.cosine_similarity(F.normalize(teacher_img_feat.float()), F.normalize(student_img_feat.float()), dim=-1)
-        metrics["similarity_mean"] = cos.mean().item()
-        metrics["similarity_median"] = cos.median().item()
+        # # --- 1. Image Encoder Similarity Metrics ---
+        # cos = F.cosine_similarity(F.normalize(teacher_img_feat.float()), F.normalize(student_img_feat.float()), dim=-1)
+        # metrics["similarity_mean"] = cos.mean().item()
+        # metrics["similarity_median"] = cos.median().item()
 
-        # --- 2. Student Standalone CLIP Performance Metrics ---
-        s_scale = unwrap_model(student).logit_scale.exp().cpu() # Get student scale
-        student_clip_metrics = get_clip_metrics(
-            image_features=student_img_feat.float(),
-            text_features=student_txt_feat.float(),
-            logit_scale=s_scale
-        )
-        # Add a prefix to distinguish these clearly
-        metrics.update({f"student_clip_{k}": v for k,v in student_clip_metrics.items()})
+        # # --- 2. Student Standalone CLIP Performance Metrics ---
+        # s_scale = unwrap_model(student).logit_scale.exp().cpu() # Get student scale
+        # student_clip_metrics = get_clip_metrics(
+        #     image_features=student_img_feat.float(),
+        #     text_features=student_txt_feat.float(),
+        #     logit_scale=s_scale
+        # )
+        # # Add a prefix to distinguish these clearly
+        # metrics.update({f"student_clip_{k}": v for k,v in student_clip_metrics.items()})
 
-        # --- 3. Optional: Teacher Baseline CLIP Performance Metrics ---
-        if need_teacher_text:
-            t_scale = unwrap_model(teacher).logit_scale.exp().cpu()  # Get teacher scale
-            teacher_clip_metrics = get_clip_metrics(
-                image_features=teacher_img_feat.float(),
-                text_features=teacher_txt_feat.float(),
-                logit_scale=t_scale
-            )
-            # Add a prefix for the baseline
-            metrics.update({f"teacher_clip_{k}": v for k,v in teacher_clip_metrics.items()})
+        # # --- 3. Optional: Teacher Baseline CLIP Performance Metrics ---
+        # if need_teacher_text:
+        #     t_scale = unwrap_model(teacher).logit_scale.exp().cpu()  # Get teacher scale
+        #     teacher_clip_metrics = get_clip_metrics(
+        #         image_features=teacher_img_feat.float(),
+        #         text_features=teacher_txt_feat.float(),
+        #         logit_scale=t_scale
+        #     )
+        #     # Add a prefix for the baseline
+        #     metrics.update({f"teacher_clip_{k}": v for k,v in teacher_clip_metrics.items()})
 
 
 

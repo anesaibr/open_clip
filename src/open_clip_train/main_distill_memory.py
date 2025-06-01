@@ -537,15 +537,23 @@ def main(args):
         dist.barrier() # Wait for all ranks to reach this point (model created, moved, rank-local sharing done)
 
         # Use a list container; rank 0 puts state, others put placeholder
-        sync_list = [student_model.state_dict() if args.rank == 0 else {}]
-        dist.broadcast_object_list(sync_list, src=0) # Broadcast from rank 0
+        # sync_list = [student_model.state_dict() if args.rank == 0 else {}]
+        # dist.broadcast_object_list(sync_list, src=0) # Broadcast from rank 0
 
-        if args.rank != 0:
-            logging.info(f"Rank {args.rank}: Receiving and loading synchronized model state...")
-            student_model.load_state_dict(sync_list[0]) # Load the state received from rank 0
-            logging.info(f"Rank {args.rank}: State loaded.")
-        else:
-            logging.info("Rank 0: Broadcast complete.")
+        # if args.rank != 0:
+        #     logging.info(f"Rank {args.rank}: Receiving and loading synchronized model state...")
+        #     student_model.load_state_dict(sync_list[0]) # Load the state received from rank 0
+        #     logging.info(f"Rank {args.rank}: State loaded.")
+        # else:
+        #     logging.info("Rank 0: Broadcast complete.")
+
+        for param_name, param_tensor_on_rank0 in student_model.state_dict().items():
+            current_param_tensor = param_tensor_on_rank0.to(device) 
+            tensor_to_sync = student_model.state_dict()[param_name] # Get this rank's tensor
+            tensor_to_sync = tensor_to_sync.to(device) # Ensure it's on device
+            # Rank 0's tensor_to_sync is the source.
+            # Other ranks' tensor_to_sync will be overwritten.
+            dist.broadcast(tensor_to_sync, src=0)
 
         dist.barrier() # Wait for all ranks to finish loading
         logging.info(f"Rank {args.rank}: State synchronization complete.")
