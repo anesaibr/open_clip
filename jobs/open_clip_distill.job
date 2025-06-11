@@ -1,14 +1,16 @@
 #!/bin/bash
 
 #SBATCH --partition=gpu_a100            # or gpu_a100 (cpu:72)
-#SBATCH --gpus=2                        # Max GPUs per node (4)
-#SBATCH --job-name=DistillCLIP2Large
+#SBATCH --gpus=1                        # Max GPUs per node (4)
+#SBATCH --job-name=DistillCLIPTeacher_sharegpt4v  # Job name
 #SBATCH --ntasks=1                      # 1 task (total)
-#SBATCH --cpus-per-task=64            # ~16-18 CPUs per GPU (64/4 -> gpu_h100 or 72/4 -> gpu_a100)
-#SBATCH --time=12:00:00         # Max allowed time (120 hours)
+#SBATCH --cpus-per-task=18           # ~16-18 CPUs per GPU (64/4 -> gpu_h100 or 72/4 -> gpu_a100)
+#SBATCH --time=01:50:00         # Max allowed time (120 hours)
 #SBATCH --output=output/success/out-%x.%A.out
 #SBATCH --error=output/error/out-%x.%A.err
 
+
+#  SBATCH --mem=480G                  # Max memory per node (480G for gpu_a100, 720G for gpu_h100)
 module purge
 module load 2023
 module load Anaconda3/2023.07-2
@@ -35,6 +37,10 @@ source activate memory_clip
 export TORCH_DISTRIBUTED_DEBUG=DETAIL # Detailed PyTorch distributed logs
 # export CUDA_LAUNCH_BLOCKING=1
 
+# (72 CPUs / 4 processes = 18 CPUs per process)
+# If args.workers is 8, then 18 - 8 = 10 threads for PyTorch ops per process.
+# export OMP_NUM_THREADS=10 # Adjust based on args.workers
+# echo "OMP_NUM_THREADS: $OMP_NUM_THREADS"
 
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 echo "SLURM_LOCAL_RANK: $SLURM_LOCAL_RANK"
@@ -61,30 +67,91 @@ echo "WORLD_SIZE: $WORLD_SIZE"
 # --val-data "/projects/0/prjs1465/ShareGPT4V/sharegpt4v/share-captioner_coco_lcs_sam_1246k_1107_val.csv" \
 # --dataset-type=csv \
 
-torchrun --nproc_per_node 2 -m src.open_clip_train.main_distill_memory -- \
-    --resume "/projects/0/prjs1465/logs/2025_05_21-17_54_17-distill_memory_ViT-B-16-model_ViT-B-16-lr_0.0005-b_20-j_2-p_amp_bf16-loss_cosine/checkpoints/epoch_6.pt" \
-    --save-frequency 1 \
-    --train-data="/scratch-shared/Sharegpt4v/wds_multitar_v1/{000000..000624}.tar" \
-    --val-data="/projects/0/prjs1465/ShareGPT4V/wds_sharegpt4v/val/{000000..000001}.tar"  \
-    --train-num-samples 625000 \
-    --val-num-samples 2000 \
-    --dataset-type=webdataset \
-    --use-memory \
-    --warmup 1000 \
-    --batch-size=20  \
-    --accum-freq 4 \
-    --lr=5e-4 \
-    --wd=0.1 \
-    --epochs=10 \
-    --workers=2 \
-    --grad-checkpointing \
-    --model ViT-B-16 \
-    --precision amp_bf16 \
-    --pretrained "openai" \
-    --report-to wandb \
-    --wandb-project-name "memory-open-clip" \
-    --loss-type "cosine" \
-    --logs="/projects/0/prjs1465/logs" \
-    --log-every-n-steps 100 
+#ShareGPT4V dataset (Shard version)
+# --train-data="/projects/0/prjs1465/ShareGPT4V/wds_sharegpt4v/train/{000000..000125}.tar" \
+# --val-data="/projects/0/prjs1465/ShareGPT4V/wds_sharegpt4v/val/{000000..000001}.tar"  \
+# --train-num-samples 1245902 \
+# --val-num-samples 2000 \
 
-# torchrun --nproc_per_node 4 -m testing_dist
+# torchrun --nproc_per_node 3 -m src.open_clip_train.main_distill_memory -- \
+#     --save-frequency 1 \
+#     --train-data="/projects/0/prjs1465/ShareGPT4V/wds_mscoco/mscoco_train/{00000..00059}.tar" \
+#     --val-data="/projects/0/prjs1465/ShareGPT4V/wds_mscoco/mscoco_val/{00000..00002}.tar"  \
+#     --train-num-samples 591753 \
+#     --val-num-samples 25014 \
+#     --dataset-type=webdataset \
+#     --use-memory \
+#     --warmup 1000 \
+#     --batch-size=20  \
+#     --accum-freq 4 \
+#     --lr=5e-4 \
+#     --wd=0.1 \
+#     --epochs=10 \
+#     --workers=2 \
+#     --grad-checkpointing \
+#     --model ViT-B-16 \
+#     --precision amp_bf16 \
+#     --pretrained "openai" \
+#     --report-to wandb \
+#     --wandb-project-name "memory-open-clip" \
+#     --loss-type "cosine" \
+#     --logs="/projects/0/prjs1465/logs" \
+#     --log-every-n-steps 100 
+
+
+# ------ Evaluation of the teacher model (baseline) without memory ------
+
+# -- MSCOCO dataset (Shard version)
+# torchrun --nproc_per_node 1 \
+#     --rdzv-id=$SLURM_JOB_ID \
+#     -m src.open_clip_train.main -- \
+#     --val-data="/scratch-shared/mscoco/mscoco_val/{00000..00002}.tar" \
+#     --dataset_name "mscoco" \
+#     --val-num-samples 25014 \
+#     --dataset-type=webdataset \
+#     --model ViT-B-16 \
+#     --pretrained "openai" \
+#     --precision amp_bf16 \
+#     --batch-size=16  \
+#     --workers=2 \
+#     --epochs=0 \
+#     --logs="/projects/0/prjs1465/logs/teacher_baseline_eval" \
+#     --report-to "none" \
+
+# -- ShareGPT4V dataset (Shard version)
+
+# -- Evaluation of the teacher model (baseline) without memory on ShareGPT4V dataset ------
+torchrun --nproc_per_node 1 \
+    --rdzv-id=$SLURM_JOB_ID \
+    -m src.open_clip_train.main -- \
+    --val-data="/projects/0/prjs1465/ShareGPT4V/wds_sharegpt4v/val_1/000000.tar" \
+    --dataset_name "sharegpt4v" \
+    --val-num-samples 1000 \
+    --dataset-type=webdataset \
+    --model ViT-B-16 \
+    --pretrained "openai" \
+    --precision amp_bf16 \
+    --batch-size=16  \
+    --workers=2 \
+    --epochs=0 \
+    --logs="/projects/0/prjs1465/logs/teacher_baseline_eval" \
+    --report-to "none" \
+
+# ------ Evaluation of the student model with memory on ShareGPT4V dataset ------
+# torchrun --nproc_per_node 1 \
+#     --rdzv-id=$SLURM_JOB_ID \
+#     -m src.open_clip_train.main_distill_memory -- \
+#     --resume="/projects/0/prjs1465/logs/2025_05_29-13_27_02-distill_memory_ViT-B-16-model_ViT-B-16-lr_0.0005-b_20-j_8-p_amp_bf16-loss_cosine/checkpoints/epoch_23.pt" \
+#     --val-data="/projects/0/prjs1465/ShareGPT4V/wds_sharegpt4v/val_1/000000.tar" \
+#     --dataset_name "sharegpt4v" \
+#     --val-num-samples 1000 \
+#     --dataset-type=webdataset \
+#     --use-memory \
+#     --model ViT-B-16 \
+#     --pretrained "openai" \
+#     --precision amp_bf16 \
+#     --batch-size=16  \
+#     --workers=2 \
+#     --epochs=0 \
+#     --logs="/projects/0/prjs1465/logs/teacher_baseline_eval" \
+#     --report-to "none" \

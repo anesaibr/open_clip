@@ -805,12 +805,15 @@ def main(args):
         model = torch.compile(original_model)
 
     if 'train' not in data:
+        logging.info(f"Rank {args.rank}: Detected evaluation-only mode (no train data).")
         # If using int8, convert to inference mode.
         if args.use_bnb_linear is not None:
             from open_clip.utils import convert_int8_model_to_inference_mode
             convert_int8_model_to_inference_mode(model)
+        # logging.info("Evaluating teacher model baseline (Teacher Vision + Teacher Text)...")
         # Evaluate.
-        evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+        # evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+        evaluate(model, student_model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
         return
 
     loss = create_loss(args)

@@ -373,6 +373,10 @@ def train_one_epoch(model,student_model,data, loss, epoch, optimizer, scaler, sc
             data_time_m.reset()
     # end for
 
+def extract_coco_image_id(url):
+   match = re.search(r'(\d{12})\.jpg$', url)
+   return int(match.group(1)) if match else None
+
 
 def evaluate(teacher, student,data, epoch, args, tb_writer=None, tokenizer=None):
     metrics = {}
@@ -391,124 +395,112 @@ def evaluate(teacher, student,data, epoch, args, tb_writer=None, tokenizer=None)
     input_dtype = get_input_dtype(args.precision)
 
     if 'val' in data and (args.val_frequency and ((epoch % args.val_frequency) == 0 or epoch == args.epochs)):
-        dataloader = data['val'].dataloader
-        num_samples = 0
-        samples_per_val = dataloader.num_samples
+        # dataloader = data['val'].dataloader
+        # num_samples = 0
+        val_loader = data['val'].dataloader
+        samples_per_val = val_loader.num_samples
 
-        # FIXME this does not scale past small eval datasets
-        # all_image_features @ all_text_features will blow up memory and compute very quickly
-        cumulative_loss = 0.0
-        cumulative_gen_loss = 0.0
-        all_image_features, all_text_features = [], []
+        if args.dataset_name.lower() == "mscoco":
+            # --- STEP A: 1→5 grouping by COCO ID from URL ---
+            all_I_dict, all_T_list, all_TX_keys = {}, [], []
+            with torch.inference_mode():
+                for images_b, texts_b, urls_b in val_loader:
+                    images_b = images_b.to(device, dtype=input_dtype)
+                    texts_b  = texts_b.to(device)
+                    with autocast():
+                        # student encodes images, teacher encodes texts
+                        I = unwrap_model(student).encode_image(images_b).float()
+                        T = unwrap_model(teacher).encode_text(texts_b).float()
+                        scale = unwrap_model(teacher).logit_scale.mean()
+                    # collect features + group by 12-digit COCO ID
+                    for i in range(len(urls_b)):
+                        img_id = extract_coco_image_id(urls_b[i])
+                        key   = str(img_id).zfill(12)
+                        all_T_list.append(T[i].cpu())
+                        all_TX_keys.append(key)
+                        if key not in all_I_dict:
+                            all_I_dict[key] = I[i].cpu()
 
-        with torch.no_grad():
-            for i, batch in enumerate(dataloader):
-                images, texts = batch
-                images = images.to(device=device, dtype=input_dtype, non_blocking=True)
-                texts = texts.to(device=device, non_blocking=True)
+            # stack into (N_img, D) and (N_txt, D)
+            img_keys = list(all_I_dict.keys())
+            all_I = torch.stack([all_I_dict[k] for k in img_keys], dim=0)
+            all_T = torch.stack(all_T_list, dim=0)
 
-                with autocast():
-                    # model_out = model(images, texts)
-                    #NOTE: This is a workaround for the fact that CLIP models return a dict due to 'output_dict=True' in the student model inside 'main_distill_memory.py'.
-                    image_features = unwrap_model(student).encode_image(images).float() # or maybe : student(images)['image_features'].float()
-                    text_features = unwrap_model(teacher).encode_text(texts).float()
-                    logit_scale = unwrap_model(teacher).logit_scale
-                    model_out = {"image_features": image_features, "text_features": text_features, "logit_scale": logit_scale}
-                    
-                    # --- My Other Method ---
-                    # teacher_image_features = unwrap_model(teacher).encode_image(images, normalize=True)
-                    # student_image_features = unwrap_model(student).encode_image(images, normalize=True)
-                    # all_teacher_img_feat.append(teacher_image_features.cpu())
-                    # all_student_img_feat.append(student_image_features.cpu())
+            # build txt2img/img2txt
+            N_img, N_txt = len(img_keys), len(all_T_list)
+            txt2img = {}
+            img2txt = {i: [] for i in range(N_img)}
+            for j, key in enumerate(all_TX_keys):
+                i = img_keys.index(key)
+                txt2img[j] = i
+                img2txt[i].append(j)
 
-                    # student_text_features = unwrap_model(student).encode_text(texts, normalize=True)
-                    # all_student_txt_feat.append(student_text_features.cpu())
+            # compute full (N_img × N_txt) similarity on CPU
+            with torch.no_grad():
+                S = scale.cpu() * (all_I @ all_T.T)
+                # image→text R@k
+                hits_i2t = {k: 0 for k in (1, 5, 10)}
+                for i in range(N_img):
+                    row = S[i]
+                    for k in hits_i2t:
+                        if any(int(j) in img2txt[i] for j in row.topk(k).indices):
+                            hits_i2t[k] += 1
+                # text→image R@k
+                hits_t2i = {k: 0 for k in (1, 5, 10)}
+                for j in range(N_txt):
+                    col = S[:, j]
+                    for k in hits_t2i:
+                        if txt2img[j] in col.topk(k).indices:
+                            hits_t2i[k] += 1
 
-                    # if need_teacher_text:
-                    #     teacher_text_features = unwrap_model(teacher).encode_text(texts,normalize=True)
-                    #     all_teacher_txt_feat.append(teacher_text_features.cpu())
-                    # ------------------------------------------
+            val_metrics = {
+                "image_to_text_R@1":  hits_i2t[1]  / N_img,
+                "image_to_text_R@5":  hits_i2t[5]  / N_img,
+                "image_to_text_R@10": hits_i2t[10] / N_img,
+                "text_to_image_R@1":  hits_t2i[1]  / N_txt,
+                "text_to_image_R@5":  hits_t2i[5]  / N_txt,
+                "text_to_image_R@10": hits_t2i[10] / N_txt,
+            }
+            metrics.update(val_metrics)
 
-                    # --- CLIP logit and loss calculation ---
-                    # features are accumulated in CPU tensors, otherwise GPU memory exhausted quickly
-                    # however, system RAM is easily exceeded and compute time becomes problematic
-                    all_image_features.append(image_features.cpu())
-                    all_text_features.append(text_features.cpu())
-                    logit_scale = logit_scale.mean()
-                    logits_per_image = logit_scale * image_features @ text_features.t()
-                    logits_per_text = logits_per_image.t()
-
-                    batch_size = images.shape[0]
-                    labels = torch.arange(batch_size, device=device).long()
-                    total_loss = (
-                        F.cross_entropy(logits_per_image, labels) +
-                        F.cross_entropy(logits_per_text, labels)
-                    ) / 2
-
-
-                    #TODO: Decide if maybe_compute_generative_loss is still relevant.
-                    # gen_loss = maybe_compute_generative_loss(model_out)
-
-                cumulative_loss += total_loss * batch_size
-                num_samples += batch_size
-                if is_master(args) and (i % 100) == 0:
-                    logging.info(
-                        f"Eval Epoch: {epoch} [{num_samples} / {samples_per_val}]\t"
-                        f"Clip Loss: {cumulative_loss / num_samples:.6f}\t")
-
-                    # if gen_loss is not None:
-                    #     cumulative_gen_loss += gen_loss * batch_size
-                    #     logging.info(
-                    #         f"Generative Loss: {cumulative_gen_loss / num_samples:.6f}\t")
-
-            val_metrics = get_clip_metrics(
-                image_features=torch.cat(all_image_features),
-                text_features=torch.cat(all_text_features),
-                logit_scale=logit_scale.cpu(),
+        elif args.dataset_name.lower() == "sharegpt4v":
+            # --- Paired 1→1 retrieval ---
+            all_I_feats, all_T_feats = [], []
+            cum_loss, num_samples = 0.0, 0
+            with torch.no_grad():
+                for i, (images_b, texts_b) in enumerate(val_loader):
+                    images_b = images_b.to(device, dtype=input_dtype)
+                    texts_b  = texts_b.to(device)
+                    with autocast():
+                        I = unwrap_model(student).encode_image(images_b).float()
+                        T = unwrap_model(teacher).encode_text(texts_b).float()
+                        scale = unwrap_model(teacher).logit_scale.mean()
+                        logits_i2t = scale * (I @ T.t())
+                        logits_t2i = logits_i2t.t()
+                        B = images_b.size(0)
+                        labels = torch.arange(B, device=device)
+                        loss = (F.cross_entropy(logits_i2t, labels)
+                                + F.cross_entropy(logits_t2i, labels)) / 2
+                    all_I_feats.append(I.cpu())
+                    all_T_feats.append(T.cpu())
+                    cum_loss += loss.item() * B
+                    num_samples += B
+            all_I = torch.cat(all_I_feats, dim=0)
+            all_T = torch.cat(all_T_feats, dim=0)
+            val_metrics = get_clip_metrics_chunked_further(
+                all_I, all_T, scale.cpu(),
+                args=args, chunk_size=512, device=device
             )
-            loss = cumulative_loss / num_samples
-            metrics.update(
-                {**val_metrics, "clip_val_loss": loss.item(), "epoch": epoch, "num_samples": num_samples}
-            )
-            # if gen_loss is not None:
-            #     gen_loss = cumulative_gen_loss / num_samples
-            #     metrics.update({"val_generative_loss": gen_loss.item()})
+            val_metrics["clip_val_loss"] = cum_loss / num_samples
+            val_metrics["num_samples"]     = num_samples
+            val_metrics["epoch"]           = epoch
+            metrics.update(val_metrics)
 
+        else:
+            raise ValueError(f"Unknown dataset_name={args.dataset_name!r}")
 
-        # --- Concatenate Features ---
-        # teacher_img_feat = torch.cat(all_teacher_img_feat)
-        # student_img_feat = torch.cat(all_student_img_feat)
-        # student_txt_feat = torch.cat(all_student_txt_feat)
-        # if need_teacher_text:
-        #     teacher_txt_feat = torch.cat(all_teacher_txt_feat)
-        
-        # # --- 1. Image Encoder Similarity Metrics ---
-        # cos = F.cosine_similarity(F.normalize(teacher_img_feat.float()), F.normalize(student_img_feat.float()), dim=-1)
-        # metrics["similarity_mean"] = cos.mean().item()
-        # metrics["similarity_median"] = cos.median().item()
-
-        # # --- 2. Student Standalone CLIP Performance Metrics ---
-        # s_scale = unwrap_model(student).logit_scale.exp().cpu() # Get student scale
-        # student_clip_metrics = get_clip_metrics(
-        #     image_features=student_img_feat.float(),
-        #     text_features=student_txt_feat.float(),
-        #     logit_scale=s_scale
-        # )
-        # # Add a prefix to distinguish these clearly
-        # metrics.update({f"student_clip_{k}": v for k,v in student_clip_metrics.items()})
-
-        # # --- 3. Optional: Teacher Baseline CLIP Performance Metrics ---
-        # if need_teacher_text:
-        #     t_scale = unwrap_model(teacher).logit_scale.exp().cpu()  # Get teacher scale
-        #     teacher_clip_metrics = get_clip_metrics(
-        #         image_features=teacher_img_feat.float(),
-        #         text_features=teacher_txt_feat.float(),
-        #         logit_scale=t_scale
-        #     )
-        #     # Add a prefix for the baseline
-        #     metrics.update({f"teacher_clip_{k}": v for k,v in teacher_clip_metrics.items()})
-
-
+    else:
+        return {}
 
     if not metrics:
         return metrics
@@ -561,6 +553,119 @@ def get_clip_metrics(image_features, text_features, logit_scale):
             metrics[f"{name}_R@{k}"] = np.mean(preds < k)
 
     return metrics
+
+def get_clip_metrics_chunked_further(image_features_cpu, text_features_cpu, logit_scale_cpu, chunk_size=512, device='cuda', args=None):
+    metrics = {}
+    num_images = image_features_cpu.shape[0]
+    num_texts = text_features_cpu.shape[0]
+
+    # This function assumes num_images == num_texts for standard retrieval metrics
+    # and that they are paired (i-th image corresponds to i-th text).
+    if num_images != num_texts:
+        logging.warning("Number of images and texts differ; standard paired retrieval metrics might be misleading.")
+        # Fallback or error
+        return {"error": "Image and text counts differ"}
+
+
+    # Accumulators for top-k hits
+    # For image_to_text:
+    i2t_correct_at_k = {k: 0 for k in [1, 5, 10]}
+    # For text_to_image:
+    t2i_correct_at_k = {k: 0 for k in [1, 5, 10]}
+
+    # --- Image to Text Retrieval ---
+    # Query with image chunks, gallery is all texts
+    text_features_gpu = text_features_cpu.to(device) # Gallery on GPU
+    logit_scale_gpu = logit_scale_cpu.to(device)
+
+    for i in range(0, num_images, chunk_size):
+        img_chunk_cpu = image_features_cpu[i:i + chunk_size]
+        img_chunk_gpu = img_chunk_cpu.to(device)
+        current_batch_size = img_chunk_gpu.shape[0]
+
+        with torch.no_grad(), get_autocast(args.precision, device_type=device.type)():
+            # Logits for current image chunk against ALL texts
+            # Shape: (current_batch_size, num_all_texts)
+            chunk_logits_gpu = logit_scale_gpu * img_chunk_gpu @ text_features_gpu.t()
+
+        # Ground truth for this chunk (assuming paired data)
+        # For image i in the chunk, the correct text is text i (globally)
+        gt_for_chunk = torch.arange(i, i + current_batch_size, device=device)
+
+        # Get top K predictions for each image in the chunk
+        # We only need top-K for R@K, not full argsort if K is small
+        # For R@10, we need at least top 10
+        # For mean/median rank, full argsort is still needed.
+        # Let's do full argsort for now on the chunk logits (moved to CPU for argsort)
+        ranking = torch.argsort(chunk_logits_gpu.cpu(), descending=True, dim=-1) # (current_batch_size, num_all_texts)
+
+        for j in range(current_batch_size): # Iterate over images in the current chunk
+            actual_target_idx = gt_for_chunk[j].item() # The global index of the correct text
+            # Find where this actual_target_idx appears in the sorted list of predictions for image j
+            preds_for_this_image = ranking[j]
+            # Example: if preds_for_this_image = [target_idx, other1, other2, ...], then rank is 0
+            # rank_of_target = (preds_for_this_image == actual_target_idx).nonzero(as_tuple=True)[0].item()
+            # The above can be slow. A more direct way to find the rank:
+            try:
+                 rank_of_target = torch.where(preds_for_this_image == actual_target_idx)[0].item()
+            except IndexError: # Should not happen if target is in the text set
+                 rank_of_target = float('inf')
+
+
+            for k_val in i2t_correct_at_k.keys():
+                if rank_of_target < k_val:
+                    i2t_correct_at_k[k_val] += 1
+        
+        del img_chunk_gpu, chunk_logits_gpu
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    del text_features_gpu # Free gallery text features from GPU
+
+    for k_val in i2t_correct_at_k.keys():
+        metrics[f"image_to_text_R@{k_val}"] = i2t_correct_at_k[k_val] / num_images if num_images > 0 else 0.0
+
+
+    # --- Text to Image Retrieval (Symmetric Logic) ---
+    image_features_gpu = image_features_cpu.to(device) # Gallery on GPU
+
+    for i in range(0, num_texts, chunk_size):
+        txt_chunk_cpu = text_features_cpu[i:i + chunk_size]
+        txt_chunk_gpu = txt_chunk_cpu.to(device)
+        current_batch_size = txt_chunk_gpu.shape[0]
+
+        with torch.no_grad(), get_autocast(args.precision, device_type=device.type)():
+            # Logits for current text chunk against ALL images
+            # Shape: (current_batch_size, num_all_images)
+            chunk_logits_gpu = logit_scale_gpu * txt_chunk_gpu @ image_features_gpu.t()
+
+        gt_for_chunk = torch.arange(i, i + current_batch_size, device=device)
+        ranking = torch.argsort(chunk_logits_gpu.cpu(), descending=True, dim=-1)
+
+        for j in range(current_batch_size):
+            actual_target_idx = gt_for_chunk[j].item()
+            try:
+                rank_of_target = torch.where(ranking[j] == actual_target_idx)[0].item()
+            except IndexError:
+                rank_of_target = float('inf')
+
+            for k_val in t2i_correct_at_k.keys():
+                if rank_of_target < k_val:
+                    t2i_correct_at_k[k_val] += 1
+        
+        del txt_chunk_gpu, chunk_logits_gpu
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
+
+    del image_features_gpu
+
+    for k_val in t2i_correct_at_k.keys():
+        metrics[f"text_to_image_R@{k_val}"] = t2i_correct_at_k[k_val] / num_texts if num_texts > 0 else 0.0
+
+    # Mean/Median rank are harder to compute accurately without the full matrix or more complex acc.
+    # For now, focusing on R@k which is more critical and easier to chunk.
+    # You could collect all ranks and then compute mean/median if CPU RAM allows storing all ranks.
+
+    return metrics
+    
 
 
 def maybe_compute_generative_loss(model_out):

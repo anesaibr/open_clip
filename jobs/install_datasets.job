@@ -18,44 +18,44 @@ source activate memory_clip
 # python /home/aibrahimi/open_clip/sam_build_index.py
 
 # # --- Setup ---
-PROJECT_DIR="/projects/0/prjs1465/ShareGPT4V"
-# # SCRATCH_DIR="/scratch-shared/Sharegpt4v/"
-# # WDS_OUTPUT_BASE_DIR="${PROJECT_DIR}/wds_sharegpt4v" # Example: A specific output dir for these shards
-# # TRAIN_WDS_OUTPUT_BASE_DIR="${SCRATCH_DIR}/wds_sharegpt4v" # Example: A specific output dir for these shards
-# # TRAIN_CSV_FILE="${PROJECT_DIR}/sharegpt4v/share-captioner_coco_lcs_sam_1246k_1107_train.csv"
-# # VAL_CSV_FILE="${PROJECT_DIR}/sharegpt4v/share-captioner_coco_lcs_sam_1246k_1107_val.csv"
-PYTHON_SCRIPT_NAME="/home/aibrahimi/open_clip/csv2wds.py" # Assuming the python script is named this and is in the PROJECT_DIR or accessible via PATH
+# PROJECT_DIR="/projects/0/prjs1465/ShareGPT4V"
+# # # SCRATCH_DIR="/scratch-shared/Sharegpt4v/"
+# # # WDS_OUTPUT_BASE_DIR="${PROJECT_DIR}/wds_sharegpt4v" # Example: A specific output dir for these shards
+# # # TRAIN_WDS_OUTPUT_BASE_DIR="${SCRATCH_DIR}/wds_sharegpt4v" # Example: A specific output dir for these shards
+# # # TRAIN_CSV_FILE="${PROJECT_DIR}/sharegpt4v/share-captioner_coco_lcs_sam_1246k_1107_train.csv"
+# # # VAL_CSV_FILE="${PROJECT_DIR}/sharegpt4v/share-captioner_coco_lcs_sam_1246k_1107_val.csv"
+# PYTHON_SCRIPT_NAME="/home/aibrahimi/open_clip/csv2wds.py" # Assuming the python script is named this and is in the PROJECT_DIR or accessible via PATH
 
-# # Navigate to project directory (good practice)
-# cd "${PROJECT_DIR}" || { echo "Failed to cd to ${PROJECT_DIR}"; exit 1; }
+# # # Navigate to project directory (good practice)
+# # cd "${PROJECT_DIR}" || { echo "Failed to cd to ${PROJECT_DIR}"; exit 1; }
 
-echo "Starting WebDataset conversion for TRAIN split..."
+# echo "Starting WebDataset conversion for TRAIN split..."
 
-# SAM Shard
-SAM_SRC=/scratch-shared/Sharegpt4v/data/sam
-SAM_DST=$TMPDIR/sam
-mkdir -p "$SAM_DST"
-rsync -avhP --ignore-existing "$SAM_SRC/" "$SAM_DST/"
-export SAM_LOCAL_DIR="$SAM_DST" # Tell Python where to find them
+# # SAM Shard
+# SAM_SRC=/scratch-shared/Sharegpt4v/data/sam
+# SAM_DST=$TMPDIR/sam
+# mkdir -p "$SAM_DST"
+# rsync -avhP --ignore-existing "$SAM_SRC/" "$SAM_DST/"
+# export SAM_LOCAL_DIR="$SAM_DST" # Tell Python where to find them
 
-#Debugging	
-echo "SAM_LOCAL_DIR is: $SAM_LOCAL_DIR"
-echo "Target SAM TAR part for lookup (example from SAM_LOOKUP): $SAM_LOCAL_DIR/sa_000020.tar" # Use an actual shard name
-echo "Does it exist? $(ls -l $SAM_LOCAL_DIR/sa_000020.tar 2>/dev/null || echo 'NO')"
-echo "Listing some files in SAM_LOCAL_DIR ($SAM_DST):"
-ls -lA "$SAM_DST" | head -n 10
+# #Debugging	
+# echo "SAM_LOCAL_DIR is: $SAM_LOCAL_DIR"
+# echo "Target SAM TAR part for lookup (example from SAM_LOOKUP): $SAM_LOCAL_DIR/sa_000020.tar" # Use an actual shard name
+# echo "Does it exist? $(ls -l $SAM_LOCAL_DIR/sa_000020.tar 2>/dev/null || echo 'NO')"
+# echo "Listing some files in SAM_LOCAL_DIR ($SAM_DST):"
+# ls -lA "$SAM_DST" | head -n 10
 
-#  SPLIT A
-python "${PYTHON_SCRIPT_NAME}" \
-  --csv /projects/0/prjs1465/ShareGPT4V/sharegpt4v/small_train_A.csv \
-  --csv-has-header \
-  --split train \
-  --out-dir /scratch-shared/Sharegpt4v/wds_testing \
-  --shard-name-prefix "trainA_sharegpt4v" \
-  --img-key "filepath" \
-  --cap-key "title" \
-  --shard-size 10000 \
-  --workers $SLURM_CPUS_PER_TASK \
+# #  SPLIT A
+# python "${PYTHON_SCRIPT_NAME}" \
+#   --csv /projects/0/prjs1465/ShareGPT4V/sharegpt4v/small_train_A.csv \
+#   --csv-has-header \
+#   --split train \
+#   --out-dir /scratch-shared/Sharegpt4v/wds_testing \
+#   --shard-name-prefix "trainA_sharegpt4v" \
+#   --img-key "filepath" \
+#   --cap-key "title" \
+#   --shard-size 10000 \
+#   --workers $SLURM_CPUS_PER_TASK \
 
 #SPLIT B
 # python "${PYTHON_SCRIPT_NAME}" \
@@ -87,10 +87,31 @@ python "${PYTHON_SCRIPT_NAME}" \
 # echo "All conversions complete."
 
 
-# # --- MSCOCO Dataset ---
-# cd /scratch-shared/mscoco/
+# --- MSCOCO Dataset ---
+cd /scratch-shared/mscoco/
 
-# echo "Download the MSCOCO Metadata"
+# 1) Download the annotations zip (contains train+val 2017 captions)
+# wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
+
+# # 2) Unzip the annotations
+# unzip annotations_trainval2017.zip
+
+# 3) Download the MSCOCO Val2017 Metadata
+
+img2dataset \
+  --url_list       mscoco_val.parquet \
+  --input_format   "parquet" \
+  --url_col        "URL" \
+  --caption_col    "TEXT" \
+  --output_format  webdataset \
+  --output_folder  mscoco_val \
+  --processes_count 16 \
+  --thread_count    64 \
+  --image_size     256 \
+  --enable_wandb   False
+
+
+# echo "Download the MSCOCO Train2017 Metadata"
 # wget https://huggingface.co/datasets/ChristophSchuhmann/MS_COCO_2017_URL_TEXT/resolve/main/mscoco.parquet
 
 
@@ -105,3 +126,5 @@ python "${PYTHON_SCRIPT_NAME}" \
 #   --thread_count 64 \
 #   --image_size 256 \
 #   --enable_wandb True
+
+

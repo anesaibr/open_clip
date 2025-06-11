@@ -1,4 +1,3 @@
-# concatenate_wds_shards_v2.py (no re-keying)
 import os
 import tarfile
 import io
@@ -10,7 +9,7 @@ import glob # Added glob back
 
 # Configuration for concatenation
 INPUT_SHARDS_DIR = "/scratch-shared/Sharegpt4v/wds_multitar_v1" # Where your small shards are
-OUTPUT_CONCAT_DIR = "/scratch-shared/Sharegpt4v/wds_multitar_v1_concat_10k_v2" # New output
+OUTPUT_CONCAT_DIR = "/projects/0/prjs1465/ShareGPT4V/wds_sharegpt4v/trainA" # New output
 LOGICAL_SHARD_SIZE_TARGET = 10000
 # This is an estimate; actual samples per small shard might vary slightly for the last one.
 # It's used to group small shards for concatenation.

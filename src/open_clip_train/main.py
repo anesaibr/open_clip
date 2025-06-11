@@ -34,7 +34,7 @@ from open_clip_train.distributed import is_master, init_distributed_device, broa
 from open_clip_train.logger import setup_logging
 from open_clip_train.params import parse_args
 from open_clip_train.scheduler import cosine_lr, const_lr, const_lr_cooldown
-from open_clip_train.train import train_one_epoch, evaluate
+from open_clip_train.train import train_one_epoch, evaluate, unwrap_model
 from open_clip_train.file_utils import pt_load, check_exists, start_sync_process, remote_sync
 from open_clip.memory import ProductKeyArgs,HashingMemory
 from open_clip.distributed import parallelize_model, DistributedArgs,get_device_mesh
@@ -259,25 +259,25 @@ def main(args):
         **model_kwargs,
     )
 
-    # Freezing all parameters
-    for param in model.parameters():
-        param.requires_grad = False
+    # # Freezing all parameters
+    # for param in model.parameters():
+    #     param.requires_grad = False
     
-    # Unfreezing only memory layers
-    for module in model.modules():
-        if isinstance(module, HashingMemory):
-            for param in module.parameters():
-                param.requires_grad = True
+    # # Unfreezing only memory layers
+    # for module in model.modules():
+    #     if isinstance(module, HashingMemory):
+    #         for param in module.parameters():
+    #             param.requires_grad = True
 
-    # Logging total and trainable parameter counts
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    logging.info(f"Total parameters: {total_params}, Trainable parameters: {trainable_params}")
+    # # Logging total and trainable parameter counts
+    # total_params = sum(p.numel() for p in model.parameters())
+    # trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # logging.info(f"Total parameters: {total_params}, Trainable parameters: {trainable_params}")
 
-    #loggin which parameters are frozen
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            logging.info(f"Parameter '{name}' is frozen (requires_grad=False)")
+    # #loggin which parameters are frozen
+    # for name, param in model.named_parameters():
+    #     if not param.requires_grad:
+    #         logging.info(f"Parameter '{name}' is frozen (requires_grad=False)")
 
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
@@ -368,19 +368,19 @@ def main(args):
     #     fsdp_grouping_plan=None,  # or pass if needed
     # )
 
-    def mp_parallelize_all(model):
-        """
-        Minimal function to replicate the original logic that calls `mp_parallelize`
-        on each memory layer so it reassigns `self.values` from the global.
-        """
-        # We no longer need a mesh or distributed config
-        for name, submodule in model.named_modules(): # Instead of referencing `model.layers`, doing a submodule scan
-            if hasattr(submodule, "mp_parallelize"):
-                print(f"[parallelize_model] calling mp_parallelize on submodule {name}")
-                submodule.mp_parallelize(None, None, None, torch.float32)
-        return model
+    # def mp_parallelize_all(model):
+    #     """
+    #     Minimal function to replicate the original logic that calls `mp_parallelize`
+    #     on each memory layer so it reassigns `self.values` from the global.
+    #     """
+    #     # We no longer need a mesh or distributed config
+    #     for name, submodule in model.named_modules(): # Instead of referencing `model.layers`, doing a submodule scan
+    #         if hasattr(submodule, "mp_parallelize"):
+    #             print(f"[parallelize_model] calling mp_parallelize on submodule {name}")
+    #             submodule.mp_parallelize(None, None, None, torch.float32)
+    #     return model
 
-    model = mp_parallelize_all(model)
+    # model = mp_parallelize_all(model)
 
     # # Log GPU memory usage immediately after parallelization
     # for i in range(torch.cuda.device_count()):
@@ -480,6 +480,20 @@ def main(args):
             model.load_state_dict(checkpoint)
             logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
     
+    # <<< --- ADD YOUR DEBUGGING CODE HERE --- >>>
+    if is_master(args): # Make sure to import: from open_clip_train.distributed import is_master
+                       # And: from open_clip_train.train import unwrap_model (or define it if not already imported)
+        try:
+            # For OpenCLIP models, logit_scale is usually directly accessible
+            # unwrap_model handles cases where model might be wrapped (e.g., DDP)
+            logging.info(f"Initial model logit_scale after loading: {unwrap_model(model).logit_scale.item()}")
+        except AttributeError:
+            logging.info("Could not access model.logit_scale directly after loading.")
+        except Exception as e:
+            logging.error(f"Error accessing logit_scale: {e}")
+    # <<< --- END OF DEBUGGING CODE --- >>>
+
+
     # initialize datasets
     tokenizer = get_tokenizer(args.model, cache_dir=args.cache_dir)
     data = get_data(
@@ -553,6 +567,7 @@ def main(args):
         model = torch.compile(original_model)
 
     if 'train' not in data:
+        logging.info("Detected evaluation-only mode (no train data).")
         # If using int8, convert to inference mode.
         if args.use_bnb_linear is not None:
             from open_clip.utils import convert_int8_model_to_inference_mode

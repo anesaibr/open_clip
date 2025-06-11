@@ -49,6 +49,12 @@ def parse_args(args):
         help="Path to file(s) with validation data",
     )
     parser.add_argument(
+        "--dataset_name",
+        type=str,
+        default=None,
+        help="Name of the dataset to use. Currently supported datasets are: 'coco', 'sharegpt4v'. ",
+    )
+    parser.add_argument(
         "--train-num-samples",
         type=int,
         default=None,

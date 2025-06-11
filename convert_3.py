@@ -19,17 +19,17 @@ DATASET_TARS_BASE_PATH = '/projects/0/prjs1465/ShareGPT4V/'
 # Names of the dataset tar files
 TAR_FILES = {
     "sam": os.path.join(DATASET_TARS_BASE_PATH, "sam.tar"),
-    "coco": os.path.join(DATASET_TARS_BASE_PATH, "coco.tar"),
-    "llava": os.path.join(DATASET_TARS_BASE_PATH, "llava.tar"),
+    # "coco": os.path.join(DATASET_TARS_BASE_PATH, "coco.tar"),
+    # "llava": os.path.join(DATASET_TARS_BASE_PATH, "llava.tar"),
     # Add other datasets and their tar files here if needed
 }
 # CSV_PATH = "/projects/0/prjs1465/ShareGPT4V/sharegpt4v/train_A.csv"
 # OUTPUT_DIR = "/scratch-shared/Sharegpt4v/wds_multitar_v1"
-CSV_PATH  = "/projects/0/prjs1465/ShareGPT4V/sharegpt4v/train_B.csv"
-OUTPUT_DIR = "/projects/0/prjs1465/ShareGPT4V/wds_sharegpt4v/trainB"
+CSV_PATH  = "/projects/0/prjs1465/ShareGPT4V/sharegpt4v/cleaned_validation.csv"
+OUTPUT_DIR = "/projects/0/prjs1465/ShareGPT4V/wds_sharegpt4v/val_1"
 INDEX_OUTPUT_DIR = "/projects/0/prjs1465/ShareGPT4V/tar_indexes" 
-SAMPLES_PER_OUTPUT_SHARD = 10000
-SAMPLES_PER_DISPATCH_CHUNK =  10000 #10000
+SAMPLES_PER_OUTPUT_SHARD = 1000
+SAMPLES_PER_DISPATCH_CHUNK =  1000 #10000
 
 try:
     SLURM_CPUS_ALLOCATED = int(os.environ.get('SLURM_CPUS_PER_TASK', str(mp.cpu_count())))
@@ -39,10 +39,10 @@ except ValueError:
 NUM_WRITER_WORKERS = max(1, SLURM_CPUS_ALLOCATED - 2)
 if SLURM_CPUS_ALLOCATED <= 2: NUM_WRITER_WORKERS = 1
 
-CSV_SEP = "\t"
+CSV_SEP = ","  # Change to '\t' if your CSV is tab-separated
 IMG_COL = "filepath"
 CAP_COL = "title"
-WRITER_QUEUE_SIZE = 2000
+WRITER_QUEUE_SIZE = 1000
 
 # Path prefix in CSV to strip to get member path for tar files
 CSV_PATH_PREFIX_TO_STRIP = "/projects/0/prjs1465/ShareGPT4V/data/"

@@ -9,6 +9,7 @@ import braceexpand
 from dataclasses import dataclass
 from multiprocessing import Value
 
+import re
 import numpy as np
 import pandas as pd
 import torch
@@ -386,14 +387,69 @@ def get_wds_dataset(args, preprocess_img, is_train, epoch=0, floor=False, tokeni
             # at this point, we have an iterator over the shards assigned to each worker
             wds.tarfile_to_samples(handler=log_and_continue),
         ])
-    pipeline.extend([
-        wds.select(filter_no_caption_or_no_image),
-        wds.decode("pilrgb", handler=log_and_continue),
-        wds.rename(image="jpg;png;jpeg;webp", text="txt"),
-        wds.map_dict(image=preprocess_img, text=lambda text: tokenizer(text)[0]),
-        wds.to_tuple("image", "text"),
-        wds.batched(args.batch_size, partial=not is_train)
-    ])
+    
+    # 1) filtering bad samples, decoding images, renaming fields
+    pipeline.extend(
+        [
+            wds.select(filter_no_caption_or_no_image),
+            wds.decode("pilrgb", handler=log_and_continue),
+        ]
+    )
+
+    # 2) Now branch on is_train:
+    if is_train:
+        #
+        # ─── TRAINING PIPELINE ───
+        #
+        # Keeping exactly the old behavior for training: drop the JSON after decoding,
+        # preprocess and tokenize, and emit (image, text) ONLY.
+        #
+        pipeline.extend(
+            [
+                # Rename the image bytes and text bytes:
+                wds.rename(image="jpg;png;jpeg;webp", text="txt"),
+                # Preprocess image, tokenize text
+                wds.map_dict(
+                    image=preprocess_img,
+                    text=lambda text: tokenizer(text)[0],
+                ),
+                # Emit two‐tuple (image_tensor, text_tensor)
+                wds.to_tuple("image", "text"),
+                wds.batched(args.batch_size, partial=not is_train),
+            ]
+        )
+    else:
+        #
+        # ─── VALIDATION PIPELINE ───
+        #
+        # still decoding and tokenizing, but *also* grabbing the URL string
+        # from the JSON metadata, so we can use it for evaluation.
+        #
+        if args.dataset_name.lower() == "mscoco":
+            # COCO: emit (image, text, url) for 1:5 grouping
+            pipeline.extend([
+                wds.rename(image="jpg;png;jpeg;webp", text="txt", coco_meta="json"),
+                wds.map(lambda sample: {
+                    "image": preprocess_img(sample["image"]),
+                    "text":  tokenizer(sample["text"])[0],
+                    "url":   sample["coco_meta"]["url"],
+                }),
+                wds.to_tuple("image", "text", "url"),
+                wds.batched(args.batch_size, partial=not is_train),
+            ])
+        elif args.dataset_name.lower() == "sharegpt4v":
+            # ShareGPT4V: emit (image, text) for 1:1 paired eval
+            pipeline.extend([
+                wds.rename(image="jpg;png;jpeg;webp", text="txt"),
+                wds.map_dict(
+                    image=preprocess_img,
+                    text=lambda txt: tokenizer(txt)[0],
+                ),
+                wds.to_tuple("image", "text"),
+                wds.batched(args.batch_size, partial=not is_train),
+            ])
+        else:
+            raise ValueError(f"Unknown dataset_name={args.dataset_name!r}. Must be 'mscoco' or 'sharegpt4v'.")
 
     dataset = wds.DataPipeline(*pipeline)
 
