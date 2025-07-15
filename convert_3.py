@@ -1,4 +1,3 @@
-# convert_4.py
 import os
 import tarfile
 import multiprocessing as mp
@@ -15,21 +14,21 @@ import pickle
 
 # --- Configuration ---
 # Base path where individual dataset tar files are located
-DATASET_TARS_BASE_PATH = '/projects/0/prjs1465/ShareGPT4V/' 
+DATASET_TARS_BASE_PATH = '/var/scratch/aibrahim/ShareGPT4V' 
 # Names of the dataset tar files
 TAR_FILES = {
     "sam": os.path.join(DATASET_TARS_BASE_PATH, "sam.tar"),
-    # "coco": os.path.join(DATASET_TARS_BASE_PATH, "coco.tar"),
+    "coco": os.path.join(DATASET_TARS_BASE_PATH, "coco.tar"),
     # "llava": os.path.join(DATASET_TARS_BASE_PATH, "llava.tar"),
     # Add other datasets and their tar files here if needed
 }
-# CSV_PATH = "/projects/0/prjs1465/ShareGPT4V/sharegpt4v/train_A.csv"
-# OUTPUT_DIR = "/scratch-shared/Sharegpt4v/wds_multitar_v1"
-CSV_PATH  = "/projects/0/prjs1465/ShareGPT4V/sharegpt4v/cleaned_validation.csv"
-OUTPUT_DIR = "/projects/0/prjs1465/ShareGPT4V/wds_sharegpt4v/val_1"
-INDEX_OUTPUT_DIR = "/projects/0/prjs1465/ShareGPT4V/tar_indexes" 
-SAMPLES_PER_OUTPUT_SHARD = 1000
-SAMPLES_PER_DISPATCH_CHUNK =  1000 #10000
+CSV_PATH = "/var/scratch/aibrahim/ShareGPT4V/sharegpt4v/train_A.csv"
+OUTPUT_DIR = "/var/scratch/aibrahim/ShareGPT4V/wds_sharegpt4v/train/train_A"
+# CSV_PATH  = "/var/scratch/aibrahim/ShareGPT4V/sharegpt4v/cleaned_validation_fixed.csv"
+# OUTPUT_DIR = "/var/scratch/aibrahim/ShareGPT4V/wds_sharegpt4v/val"
+INDEX_OUTPUT_DIR = "/var/scratch/aibrahim/ShareGPT4V/tar_indexes" 
+SAMPLES_PER_OUTPUT_SHARD = 1000 #  states desired target size for the final, logical WebDataset shards
+SAMPLES_PER_DISPATCH_CHUNK =  10000 #10000  #defines the maximum number of samples (where each sample is (img_filename_basename, img_data, caption)) that the output_samples_buffer in the main process will accumulate 
 
 try:
     SLURM_CPUS_ALLOCATED = int(os.environ.get('SLURM_CPUS_PER_TASK', str(mp.cpu_count())))
@@ -39,13 +38,13 @@ except ValueError:
 NUM_WRITER_WORKERS = max(1, SLURM_CPUS_ALLOCATED - 2)
 if SLURM_CPUS_ALLOCATED <= 2: NUM_WRITER_WORKERS = 1
 
-CSV_SEP = ","  # Change to '\t' if your CSV is tab-separated
+CSV_SEP = "\t"  # Change to '\t' if your CSV is tab-separated
 IMG_COL = "filepath"
 CAP_COL = "title"
-WRITER_QUEUE_SIZE = 1000
+WRITER_QUEUE_SIZE = 1000 # primarily affects memory usage and the execution flow/speed of the reader process vs. the main loop.
 
 # Path prefix in CSV to strip to get member path for tar files
-CSV_PATH_PREFIX_TO_STRIP = "/projects/0/prjs1465/ShareGPT4V/data/"
+CSV_PATH_PREFIX_TO_STRIP = "/var/scratch/aibrahim/ShareGPT4V/data/"
 
 # --- Helper Functions (csv_rows, create_shard - largely unchanged) ---
 def csv_rows(csv_path, img_col, cap_col, sep, has_header):
@@ -149,7 +148,17 @@ def multi_tar_reader_process(
             start_load_time   = time.time()
             with open(index_file_path, "rb") as f_idx:
                 member_map = pickle.load(f_idx)
+            # tar_member_maps[source_tag] = member_map
             tar_member_maps[source_tag] = member_map
+
+            # for sam: build a basename→membername map so we can find files
+            if source_tag == "sam":
+                basename_map = {
+                    os.path.basename(member_name): member_name
+                    for member_name in member_map.keys()
+                }
+                tar_member_maps["sam_basenames"] = basename_map
+
             logging.info(f"[MT_READER {pid}] Loaded index for '{source_tag}' ({len(member_map)} entries) in {time.time() - start_load_time:.2f}s.")
             
             tar_file_objects[source_tag] = tarfile.open(tar_path, "r")
@@ -209,8 +218,14 @@ def multi_tar_reader_process(
         tf_source = tar_file_objects[source_tag]
         member_map_source = tar_member_maps[source_tag]
 
-        if member_path_in_tar in member_map_source:
-            member_info = member_map_source[member_path_in_tar]
+        # if member_path_in_tar in member_map_source:
+        actual_name = member_path_in_tar
+        if source_tag == "sam" and member_path_in_tar not in member_map_source:
+            # fallback: look up full path by basename
+            bm = tar_member_maps.get("sam_basenames", {})
+            actual_name = bm.get(member_path_in_tar, None)
+        if actual_name and actual_name in member_map_source:
+            member_info = member_map_source[actual_name]
             try:
                 with tf_source.extractfile(member_info) as f_member:
                     img_data = f_member.read()
@@ -290,10 +305,21 @@ if __name__ == "__main__":
             logging.warning(f"CSV path '{img_path_csv}' does not start with expected prefix '{CSV_PATH_PREFIX_TO_STRIP}'. Cannot determine source tar. Skipping.")
             continue
 
-        parts = path_relative_to_data_dir.split(os.sep, 1)
-        source_tag_candidate = parts[0].lower() # "coco", "sam", "llava"
+        # parts = path_relative_to_data_dir.split(os.sep, 1)
+        # source_tag_candidate = parts[0].lower() # "coco", "sam", "llava"
         
-        member_path_in_tar = path_relative_to_data_dir # This IS the member path, e.g. "coco/train2017/000..."
+        # member_path_in_tar = path_relative_to_data_dir # This IS the member path, e.g. "coco/train2017/000..."
+
+        # special SAM case: bare filenames starting with 'sa_'
+        basename = os.path.basename(path_relative_to_data_dir)
+        if basename.lower().startswith("sa_") and basename.lower().endswith((".jpg", ".jpeg")):
+            source_tag_candidate = "sam"
+            member_path_in_tar   = basename
+        else:
+            # existing logic for other datasets
+            parts = path_relative_to_data_dir.split(os.sep, 1)
+            source_tag_candidate = parts[0].lower()
+            member_path_in_tar   = path_relative_to_data_dir
 
         if source_tag_candidate in TAR_FILES:
             # Only add if it's the first time we see this full CSV path (to handle first caption logic)
