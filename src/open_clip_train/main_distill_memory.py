@@ -84,16 +84,16 @@ def auto_layers_string(n_blocks, skip_first=True, step=2):
 
 def build_memory_args_automatically(vision_blocks_count):
     # Injecting memory every 2 layers from layer 2 onwards:
-    layers_str = auto_layers_string(vision_blocks_count, skip_first=True, step=2)
+    # layers_str = auto_layers_string(vision_blocks_count, skip_first=True, step=2)
     # Then build your normal ProductKeyArgs
     mem_args = ProductKeyArgs(
         is_enabled=True,
-        layers=layers_str,
-        mem_n_keys=8,  #make sure 'mem_n_keys **2 mod BLOCK_SIZE(8) == 0'
+        layers="4,6,8,10,11",
+        mem_n_keys=64,  #make sure 'mem_n_keys **2 mod BLOCK_SIZE(8) == 0'
         mem_heads=2,
-        mem_knn=4,
+        mem_knn=64, #WARNING: operation will fail if knn > mem_n_keys
         mem_k_dim=256,
-        mem_v_dim=256,  #Replacing -1 with  a power of two for v_dim , reducing from 512 to 256
+        mem_v_dim=1024,  #Replacing -1 with  a power of two for v_dim , reducing from 512 to 256
         mem_share_values=True,  #  if False ---> each layer gets its own memory table
     )
     return mem_args
@@ -216,6 +216,26 @@ def load_weights_with_memory_layers(student_model, teacher_state_dict, memory_ar
         logging.info(f" Total keys in teacher: {len(teacher_state_dict)}")
         logging.info(f" Total keys in student: {len(student_sd)}")
 
+class EarlyStopper:
+    def __init__(self, patience=3, min_delta=0.0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best = float('inf')  # for loss; for a metric-to-maximize use -inf
+
+    def __call__(self, value):
+        """
+        Returns True if we should stop.
+        For loss: value < best-delta resets; value > best+delta increments counter.
+        For a “higher is better” metric, flip the comparisons and initialize best=-inf.
+        """
+        if value < self.best - self.min_delta:
+            self.best = value
+            self.counter = 0
+            return False
+        else:
+            self.counter += 1
+            return self.counter >= self.patience
 
 def main(args):
     args = parse_args(args)
@@ -547,12 +567,10 @@ def main(args):
         # else:
         #     logging.info("Rank 0: Broadcast complete.")
 
-        for param_name, param_tensor_on_rank0 in student_model.state_dict().items():
-            current_param_tensor = param_tensor_on_rank0.to(device) 
-            tensor_to_sync = student_model.state_dict()[param_name] # Get this rank's tensor
-            tensor_to_sync = tensor_to_sync.to(device) # Ensure it's on device
-            # Rank 0's tensor_to_sync is the source.
-            # Other ranks' tensor_to_sync will be overwritten.
+        state_dict_to_sync = student_model.state_dict()
+        for param_name, tensor_to_sync in state_dict_to_sync.items():
+            tensor_to_sync = tensor_to_sync.to(device) # Ensure tensor is on the correct device
+            # Rank 0's tensor is the source. Other ranks' tensors will be overwritten.
             dist.broadcast(tensor_to_sync, src=0)
 
         dist.barrier() # Wait for all ranks to finish loading
@@ -813,10 +831,15 @@ def main(args):
         # logging.info("Evaluating teacher model baseline (Teacher Vision + Teacher Text)...")
         # Evaluate.
         # evaluate(model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
-        evaluate(model, student_model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+        evaluate(model, student_model, data, start_epoch, args, tb_writer=writer, tokenizer=tokenizer,return_mode =False)
         return
 
     loss = create_loss(args)
+
+    early_stopper = EarlyStopper(
+        patience=args.early_stop_patience,
+        min_delta=args.early_stop_min_delta,
+    )
 
     logging.info(f"Rank {args.rank}: Starting training loop from epoch {start_epoch}...")
     for epoch in range(start_epoch, args.epochs):
@@ -827,9 +850,45 @@ def main(args):
         train_one_epoch(model,student_model,data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=writer)
         completed_epoch = epoch + 1
 
+        val_loss = None
         if any(v in data for v in ('val', 'imagenet-val', 'imagenet-v2')):
             # evaluate(model, data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
-            evaluate(model,student_model,data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer)
+            val_metrics = evaluate(model,student_model,data, completed_epoch, args, tb_writer=writer, tokenizer=tokenizer,return_mode =False)
+            val_loss    = val_metrics.get("clip_val_loss", None)
+        
+        if val_loss is None:
+            # either skip early stopping this epoch
+            if is_master(args):
+                logging.warning(f"Epoch {completed_epoch}: no clip_val_loss returned, skipping early‐stop check")
+        
+        # --- early stopping check ---
+        if val_loss is not None and early_stopper(val_loss):
+            if is_master(args):
+                logging.info(
+                    f"No validation‐loss improvement for "
+                    f"{early_stopper.patience} epochs. "
+                    f"Stopping at epoch {completed_epoch}."
+                )
+            if args.save_logs:
+                # build the very same checkpoint dict used below
+                checkpoint_dict = {
+                    "epoch": completed_epoch,
+                    "name": args.name,
+                    "state_dict": student_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                }
+                if scaler is not None:
+                    checkpoint_dict["scaler"] = scaler.state_dict()
+
+                # save it under a special “earlystop” filename so you don’t override regular ones
+                early_path = os.path.join(
+                    args.checkpoint_path,
+                    f"epoch_{completed_epoch}_earlystop.pt"
+                )
+                torch.save(checkpoint_dict, early_path)
+                logging.info(f"Saved early-stop checkpoint to {early_path}")
+            break
+
 
 
         # Saving checkpoints.

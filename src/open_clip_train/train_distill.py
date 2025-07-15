@@ -378,7 +378,7 @@ def extract_coco_image_id(url):
    return int(match.group(1)) if match else None
 
 
-def evaluate(teacher, student,data, epoch, args, tb_writer=None, tokenizer=None):
+def evaluate(teacher, student,data, epoch, args, tb_writer=None, tokenizer=None,return_mode=False):
     metrics = {}
     if not is_master(args):
         return metrics
@@ -394,7 +394,8 @@ def evaluate(teacher, student,data, epoch, args, tb_writer=None, tokenizer=None)
     autocast = get_autocast(args.precision, device_type=device.type)
     input_dtype = get_input_dtype(args.precision)
 
-    if 'val' in data and (args.val_frequency and ((epoch % args.val_frequency) == 0 or epoch == args.epochs)):
+    # if 'val' in data and (args.val_frequency and ((epoch % args.val_frequency) == 0 or epoch == args.epochs)):
+    if 'val' in data and (args.val_frequency and ((epoch % args.val_frequency) == 0)):
         # dataloader = data['val'].dataloader
         # num_samples = 0
         val_loader = data['val'].dataloader
@@ -495,6 +496,18 @@ def evaluate(teacher, student,data, epoch, args, tb_writer=None, tokenizer=None)
             val_metrics["num_samples"]     = num_samples
             val_metrics["epoch"]           = epoch
             metrics.update(val_metrics)
+
+            # --- START: MODIFICATION FOR ANALYSIS SCRIPT ---
+            if return_mode:
+                logging.info("evaluate() called in return_mode. Returning features and metrics.")
+                # We return the computed features, scale, and the calculated metrics.
+                return {
+                    "image_features": all_I,
+                    "text_features": all_T,
+                    "logit_scale": scale.cpu(),
+                    "metrics": metrics
+                }
+            # --- END: MODIFICATION FOR ANALYSIS SCRIPT ---
 
         else:
             raise ValueError(f"Unknown dataset_name={args.dataset_name!r}")

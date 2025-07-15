@@ -480,7 +480,7 @@ def main(args):
             model.load_state_dict(checkpoint)
             logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
     
-    # <<< --- ADD YOUR DEBUGGING CODE HERE --- >>>
+    # <<< --- DEBUGGING --- >>>
     if is_master(args): # Make sure to import: from open_clip_train.distributed import is_master
                        # And: from open_clip_train.train import unwrap_model (or define it if not already imported)
         try:

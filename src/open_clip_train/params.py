@@ -54,6 +54,9 @@ def parse_args(args):
         default=None,
         help="Name of the dataset to use. Currently supported datasets are: 'coco', 'sharegpt4v'. ",
     )
+    parser.add_argument("--early_stop_patience", type=int, default=3)
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.0)
+
     parser.add_argument(
         "--train-num-samples",
         type=int,
@@ -222,6 +225,12 @@ def parse_args(args):
         type=str,
         default="RN50",
         help="Name of the vision backbone to use.",
+    )
+    parser.add_argument(
+        "--student-model",
+        default=None,
+        type=str,
+        help="path to latest student model checkpoint (default: none)",
     )
     parser.add_argument(
         "--pretrained",
