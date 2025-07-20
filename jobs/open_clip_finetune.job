@@ -1,0 +1,86 @@
+#!/bin/bash
+
+#SBATCH --partition=fatq            # or gpu_a100 (cpu:72)
+#SBATCH --gres=gpu:1                  # Max GPUs per node (4)
+#SBATCH --job-name=FinetuneCLIP_sharegpt4v  # Job name
+#SBATCH --ntasks=1                      # 1 task (total)
+#SBATCH --cpus-per-task=18           # ~16-18 CPUs per GPU (64/4 -> gpu_h100 or 72/4 -> gpu_a100)
+#SBATCH --time=30:50:00         # Max allowed time (120 hours)
+#SBATCH --chdir=/var/scratch/aibrahim/ShareGPT4V   # run from scratch!
+#SBATCH --output=/var/scratch/aibrahim/open_clip/jobs/output/success/out-%x.%A.out
+#SBATCH --error=/var/scratch/aibrahim/open_clip/jobs/output/error/out-%x.%A.err
+
+
+set -e  # Exit on error
+
+module purge
+# module load gcc/default                 # system compiler
+# module load gnu12/12.4.0
+module load cuda12.1/toolkit/12.1       # CUDA 12.1
+module load cuDNN/cuda12.1/9.1.0.70     # cuDNN for CUDA 12.1
+module load slurm/default               # (optional) slurm helper tools
+
+
+echo "Initializing conda..."
+source /var/scratch/aibrahim/miniconda3/etc/profile.d/conda.sh
+conda activate memory_clip
+
+
+
+cd /var/scratch/aibrahim/open_clip
+
+export PYTHONPATH="${PWD}/src${PYTHONPATH:+:$PYTHONPATH}"
+
+export HF_HOME="/var/scratch/${USER}/.huggingface"
+export HF_HUB_CACHE="${HF_HOME}/hub"
+export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
+mkdir -p "$HF_HUB_CACHE" "$TRANSFORMERS_CACHE"
+
+export XDG_CACHE_HOME="/var/scratch/${USER}/.cache"
+mkdir -p "$XDG_CACHE_HOME"
+
+
+
+export TORCH_DISTRIBUTED_DEBUG=DETAIL # Detailed PyTorch distributed logs
+# export CUDA_LAUNCH_BLOCKING=1
+
+
+echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "SLURM_LOCAL_RANK: $SLURM_LOCAL_RANK"
+echo "SLURM_PROCID: $SLURM_PROCID"
+echo "WORLD_SIZE: $WORLD_SIZE"
+
+
+export WANDB_API_KEY="be8cb241f3b5f74d4b20a429ea0e2fdf32b0ccdc"
+export WANDB_DIR="/var/scratch/aibrahim/logs/wandb"
+
+# --train-data="/var/scratch/aibrahim/ShareGPT4V/wds_sharegpt4v/train/{000000..000125}.tar" \
+# --train-num-samples 1245902 \
+torchrun --nproc_per_node 1 -m src.open_clip_train.main_vision_context_finetune -- \
+    --val-data="/var/scratch/aibrahim/ShareGPT4V/wds_sharegpt4v/val/000000.tar"  \
+    --val-num-samples 1000 \
+    --dataset-type=webdataset \
+    --dataset_name "sharegpt4v" \
+    --val-frequency 1 \
+    --save-frequency 1 \
+    \
+    --grad-checkpointing \
+    --model ViT-B-16 \
+    --precision amp_bf16 \
+    --pretrained "openai" \
+    \
+    --use-memory \
+    --warmup 1000 \
+    --batch-size=32   \
+    --accum-freq 2 \
+    --lr=1e-5 \
+    --wd=0.1 \
+    --epochs=10 \
+    --workers=8 \
+    \
+    --student-model '/var/scratch/aibrahim/logs/New_method_memory_values/2025_07_06-11_37_50-distill_memory_ViT-B-16-model_ViT-B-16-lr_0.0005-b_20-j_2-p_amp_bf16-loss_cosine/checkpoints/epoch_6.pt' \
+    --report-to wandb \
+    --wandb-project-name "memory-open-clip-finetuning" \
+    --loss-type "cosine" \
+    --logs="/var/scratch/aibrahim/logs" \
+    --log-every-n-steps 100 
