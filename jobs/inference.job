@@ -52,7 +52,7 @@ echo "SLURM_PROCID: $SLURM_PROCID"
 echo "WORLD_SIZE: $WORLD_SIZE"
 
 
-export WANDB_API_KEY="be8cb241f3b5f74d4b20a429ea0e2fdf32b0ccdc"
+export WANDB_API_KEY=""
 export WANDB_DIR="/var/scratch/aibrahim/logs/wandb"
 
 # --sharegpt4v-retrieval-dir ./datasets/share4v \
