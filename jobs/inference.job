@@ -1,0 +1,139 @@
+#!/bin/bash
+
+#SBATCH --partition=fatq            # or gpu_a100 (cpu:72)
+#SBATCH --gres=gpu:1                  # Max GPUs per node (4)
+#SBATCH --job-name=Memory_Eval  # Job name
+#SBATCH --ntasks=1                      # 1 task (total)
+#SBATCH --cpus-per-task=18           # ~16-18 CPUs per GPU (64/4 -> gpu_h100 or 72/4 -> gpu_a100)
+#SBATCH --time=00:50:00         # Max allowed time (120 hours)
+#SBATCH --chdir=/var/scratch/aibrahim/ShareGPT4V   # run from scratch!
+#SBATCH --output=/var/scratch/aibrahim/open_clip/jobs/output/success/out-%x.%A.out
+#SBATCH --error=/var/scratch/aibrahim/open_clip/jobs/output/error/out-%x.%A.err
+
+
+set -e  # Exit on error
+
+module purge
+# module load gcc/default                 # system compiler
+# module load gnu12/12.4.0
+module load cuda12.1/toolkit/12.1       # CUDA 12.1
+module load cuDNN/cuda12.1/9.1.0.70     # cuDNN for CUDA 12.1
+module load slurm/default               # (optional) slurm helper tools
+
+
+echo "Initializing conda..."
+source /var/scratch/aibrahim/miniconda3/etc/profile.d/conda.sh
+conda activate memory_clip
+
+
+
+cd /var/scratch/aibrahim/open_clip
+
+# export PYTHONPATH="${PWD}/src${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="${PWD}:${PWD}/src${PYTHONPATH:+:$PYTHONPATH}"
+
+export HF_HOME="/var/scratch/${USER}/.huggingface"
+export HF_HUB_CACHE="${HF_HOME}/hub"
+export TRANSFORMERS_CACHE="${HF_HOME}/transformers"
+mkdir -p "$HF_HUB_CACHE" "$TRANSFORMERS_CACHE"
+
+export XDG_CACHE_HOME="/var/scratch/${USER}/.cache"
+mkdir -p "$XDG_CACHE_HOME"
+
+
+
+export TORCH_DISTRIBUTED_DEBUG=DETAIL # Detailed PyTorch distributed logs
+# export CUDA_LAUNCH_BLOCKING=1
+
+
+echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+echo "SLURM_LOCAL_RANK: $SLURM_LOCAL_RANK"
+echo "SLURM_PROCID: $SLURM_PROCID"
+echo "WORLD_SIZE: $WORLD_SIZE"
+
+
+export WANDB_API_KEY="be8cb241f3b5f74d4b20a429ea0e2fdf32b0ccdc"
+export WANDB_DIR="/var/scratch/aibrahim/logs/wandb"
+
+# --sharegpt4v-retrieval-dir ./datasets/share4v \
+# --retrieval-sharegpt4v-1k \
+# --retrieval-sharegpt4v-10k \
+    # --retrieval-flickr \
+    # --retrieval-coco \
+    # --retrieval-docci \
+    # --retrieval-urban-1k \
+    # --retrieval-iiw \
+DATA_DIR="/var/scratch/aibrahim/datasets"
+
+
+
+# Uncomment To Evaluate Baseline Model:
+    # When wanting to evaluate the standard OpenCLIP model, use the --baseline flag & --pretrained "openai" (example) & --precision amp_bf16 .
+    # When wanting to evaluate the FLAIR model, use the --baseline flair & --huggingface-repo-name xiaorui638/flair and one of the following:
+        # --huggingface-model-name flair-cc3m-recap.pt , flair-cc12m-recap.pt, flair-merged30m.pt , flair-yfcc15m-recap.pt
+        # specify  --inference-with-flair argument 
+        # specify --precion amp 
+        # --model ViT-B-16-FLAIR \
+        # --huggingface-repo-name "xiaorui638/flair" \
+        # --huggingface-model-name "flair-cc3m-recap.pt" \
+        # --inference-with-flair \
+
+
+torchrun --nproc_per_node 1 -m eval_run -- \
+    --model ViT-B-16 \
+    --pretrained "openai" \
+    --baseline  \
+    \
+    --coco-data-root-dir  ${DATA_DIR}/coco \
+    --flickr-data-root-dir  ${DATA_DIR}/flickr30k-images \
+    --iiw-retrieval-dir  ${DATA_DIR}/imageinwords/ \
+    --docci-retrieval-dir  ${DATA_DIR}/docci \
+    --urban-1k-retrieval-dir  ${DATA_DIR}/Urban1k \
+    --dci-retrieval-dir  ${DATA_DIR}/dci \
+    \
+    --retrieval-flickr \
+    --retrieval-coco \
+    --retrieval-docci \
+    --retrieval-urban-1k \
+    --retrieval-iiw \
+    --retrieval-dci \
+    \
+    --batch-size 128 \
+    --precision amp_bf16 \
+    --workers 25 \
+    \
+    --name "eval-baseline-flair-cc3m" \
+    --logs "/var/scratch/aibrahim/logs_benchmarks" \
+    --report-to json wandb \
+    --wandb-project-name "memory-model-evaluations"
+
+
+# Uncomment To Evaluate Memory-Augmented Model 
+# torchrun --nproc_per_node 1 -m eval_memory -- \
+#     --model ViT-B-16 \
+#     --pretrained "openai" \
+#     --distilled_model_path "/var/scratch/aibrahim/logs/Finetuning/2025_07_15-11_52_38-finetune_memory_ViT-B-16lr_1e-05-b_32-j_8-p_amp_bf16-loss_cosine/checkpoints/epoch_1.pt" \
+#     --use-memory \
+#     \
+#     --coco-data-root-dir  ${DATA_DIR}/coco \
+#     --flickr-data-root-dir  ${DATA_DIR}/flickr30k-images \
+#     --iiw-retrieval-dir  ${DATA_DIR}/imageinwords/ \
+#     --docci-retrieval-dir  ${DATA_DIR}/docci \
+#     --urban-1k-retrieval-dir  ${DATA_DIR}/Urban1k \
+#     --dci-retrieval-dir  ${DATA_DIR}/dci \
+#     \
+#     --retrieval-flickr \
+#     --retrieval-coco \
+#     --retrieval-docci \
+#     --retrieval-urban-1k \
+#     --retrieval-iiw \
+#     --retrieval-dci \
+#     \
+#     --batch-size 128 \
+#     --precision amp_bf16 \
+#     --workers 25 \
+#     \
+#     --name "eval-vit-b-16-memory-model-final" \
+#     --logs "/var/scratch/aibrahim/logs_benchmarks" \
+#     --report-to json wandb \
+#     --wandb-project-name "memory-model-evaluations"
