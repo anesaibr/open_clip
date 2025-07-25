@@ -142,6 +142,20 @@ def parse_args(args):
         help="Enable memory layers.",
     )
 
+    # parser.add_argument(
+    #     "--tulip-text-checkpoint",
+    #     type=str,
+    #     default=None,
+    #     help="Path to the pre-trained TULIP TextTransformerRoPE checkpoint file (e.g., ckpt.pt)."
+    # )
+
+    parser.add_argument(
+        "--tulip-text-encoder",
+        action='store_true', 
+        default=False,
+        help="Enable the TULIP TextTransformerRoPE encoder."
+    )
+
     parser.add_argument(
         "--workers", type=int, default=4, help="Number of dataloader workers per GPU."
     )

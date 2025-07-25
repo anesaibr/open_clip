@@ -7,6 +7,7 @@ import sys
 import random
 from datetime import datetime
 from functools import partial
+from huggingface_hub import hf_hub_download
 
 import numpy as np
 import torch
@@ -24,7 +25,7 @@ except ImportError:
 try:
     import torch.utils.tensorboard as tensorboard
 except ImportError:
-    tensorboard = None
+    tensorboard = Nones
 
 try:
     import horovod.torch as hvd
@@ -76,6 +77,14 @@ def get_latest_checkpoint(path: str, remote : bool):
         return checkpoints[-1]
     return None
 
+
+def download_weights_from_hf(model_repo, filename):
+    # Define the custom cache directory relative to the current script
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pretrained")
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir, exist_ok=True)
+    local_path = hf_hub_download(repo_id=model_repo, filename=filename, cache_dir=cache_dir)
+    return local_path
 
 def main(args):
     args = parse_args(args)
@@ -268,12 +277,22 @@ def main(args):
     # # Optionally filter just the vision ones:
     # print("Vision state_dict keys:",
     #     [k for k in model.state_dict().keys() if k.startswith("visual.")])
+
+    if is_master(args):
+        logging.info("Initial Teacher Model Structure:")
+        logging.info(f"Model: {str(model)}")
+        # logging.info(f"Visual Encoder Children: {[name for name, _ in model.visual.named_children()]}")
+        # logging.info(f"Visual Encoder Parameters: {[name for name, _ in model.visual.named_parameters()]}")
+        # logging.info(f"Full State Dict Keys: {list(model.state_dict().keys())}")
+        # Check for memory-related keys (should be absent)
+        memory_keys = [k for k in model.state_dict().keys() if 'memory' in k]
+        logging.info(f"Memory-related keys in initial model: {memory_keys}")
     # # ================================================
 
     
-    ############################
-    # STUDENT MODEL
-    ############################
+    ##############################
+    # STUDENT MODEL - Vision Tower
+    ##############################
     teacher_model_cfg = get_model_config(args.model)
     vision_blocks_count = teacher_model_cfg["vision_cfg"]["layers"]
     memory_args = None
@@ -324,9 +343,6 @@ def main(args):
            for k,v in sd.items() }
 
     # Now load, strict=True will verify every weight matches
-    # missing, unexpected = student_model.load_state_dict(sd, strict=True)
-    # print("✔ loaded student, missing keys:", missing)
-    # print("✔ loaded student, unexpected keys:", unexpected)
     model_keys   = set(student_model.state_dict().keys())
     ckpt_keys    = set(sd.keys())
     missing = sorted(ckpt_keys - model_keys)
@@ -334,8 +350,185 @@ def main(args):
     student_model.load_state_dict(sd, strict=True)
     logging.info(f"Loaded student checkpoint {args.student_model!r} (use_memory={args.use_memory})")
 
-    # replace the vision encoder of the main model with the student model
+    if is_master(args):
+        logging.info("Student Model Structure After Checkpoint Load:")
+        logging.info(f"Student Model: {str(student_model)}")
+        # logging.info(f"Student Visual Encoder Children: {[name for name, _ in student_model.visual.named_children()]}")
+        # logging.info(f"Student Visual Encoder Parameters: {[name for name, _ in student_model.visual.named_parameters()]}")
+        # logging.info(f"Student Full State Dict Keys: {list(student_model.state_dict().keys())}")
+        # Check for memory-related keys
+        memory_keys = [k for k in student_model.state_dict().keys() if 'memory' in k]
+        logging.info(f"Memory-related keys in student model: {memory_keys}")
+        # Log missing and extra keys from checkpoint
+        logging.info(f"Missing keys from checkpoint: {missing}")
+        logging.info(f"Extra keys in model: {extra}")
+
+    # replace the vision encoder of the main model with the student model!!!
     model.visual = deepcopy(student_model.visual)
+
+    if is_master(args):
+        logging.info("Model Structure After Deep Copy:")
+        logging.info(f"Updated Model: {str(model)}")
+        model.load_state_dict(model.state_dict())  # Refresh state dict
+        memory_keys = [k for k in model.state_dict().keys() if 'memory' in k or 'keys' in k or 'values' in k]
+        logging.info(f"Memory-related keys after copy: {memory_keys}")
+
+
+    ##############################
+    # TULIP  Text Tower
+    ##############################
+    if args.tulip_text_encoder: 
+
+        # tulip_checkpoint_path = args.tulip_text_checkpoint
+        # if tulip_checkpoint_path.startswith('https://'):
+        #     logging.info("TULIP checkpoint is a URL. Downloading...")
+        #     parts = tulip_checkpoint_path.split('/')
+        #     repo_id = f"{parts[3]}/{parts[4]}" 
+        #     filename = parts[-1] # "ckpt.pt"
+            
+        #     # Use your existing helper to download and cache the file
+        #     tulip_checkpoint_path = download_weights_from_hf(repo_id, filename)
+        
+        # logging.info(f"Loading and transplanting TULIP RoPE text encoder from: {tulip_checkpoint_path}")
+
+
+        # 1. Get the configuration from the base model
+        teacher_cfg = get_model_config(args.model)
+        
+        # 2. Import and create the specialized TULIP text encoder instance (TextTransformerRoPE)
+        from tulip_lib.tulip.open_clip.transformer_rope import TextTransformerRoPE, precompute_freqs_cis_dynamic_ntk_scaling,\
+        text_global_pool, _expand_token
+
+        from tulip_lib.tulip.open_clip.model import CLIP
+        from tulip_lib.tulip.open_clip.factory import get_tokenizer
+        from tulip_lib.tulip.open_clip.tokenizer import DEFAULT_CONTEXT_LENGTH
+        # from tulip_lib.tulip.open_clip.training.main_context_finetune_rope import encode_text
+        
+        def encode_text(self, text, normalize: bool = False):
+            cast_dtype = self.transformer.get_cast_dtype()
+            # seq_len = text.shape[1]
+            # x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
+            # attn_mask = self.attn_mask
+            seq_len = text.shape[1]
+            # 1) Embed tokens
+            x = self.token_embedding(text).to(cast_dtype)  # [B, seq_len, D]
+            # 2) Always crop the causal mask to the actual length
+            if self.attn_mask is None:
+                attn_mask = None
+            else:
+                # self.attn_mask is [ext_ctx × ext_ctx], crop to [seq_len × seq_len]
+                attn_mask = self.attn_mask[:seq_len, :seq_len]
+            if self.cls_emb is not None:
+                seq_len += 1
+                x = torch.cat([x, _expand_token(self.cls_emb, x.shape[0])], dim=1)
+                cls_mask = self.build_cls_mask(text, cast_dtype)
+                if attn_mask is not None:
+                    attn_mask = attn_mask[None, :seq_len, :seq_len] + cls_mask[:, :seq_len, :seq_len]
+
+            x = x.permute(1, 0, 2)  # NLD -> LND
+            x = self.transformer(x, attn_mask=attn_mask)
+            x = x.permute(1, 0, 2)  # LND -> NLD
+
+            # x.shape = [batch_size, n_ctx, transformer.width]
+            if self.cls_emb is not None:
+                # presence of appended cls embed (CoCa) overrides pool_type, always take last token
+                pooled, tokens = text_global_pool(x, pool_type='last')
+                pooled = self.ln_final(pooled)  # final LN applied after pooling in this case
+            else:
+                x = self.ln_final(x)
+                pooled, tokens = text_global_pool(x, text, pool_type=self.pool_type)
+
+            if self.text_projection is not None:
+                if isinstance(self.text_projection, nn.Linear):
+                    pooled = self.text_projection(pooled)
+                else:
+                    pooled = pooled @ self.text_projection
+
+
+            return F.normalize(pooled, dim=-1) if normalize else pooled
+
+
+        extended_context_length = 77 * 3  # TULIP uses a longer context length
+        rope_text_encoder  = TextTransformerRoPE(context_length=extended_context_length,
+                                        vocab_size=teacher_cfg["text_cfg"]["vocab_size"],
+                                        width=teacher_cfg["text_cfg"]["width"],
+                                        heads=teacher_cfg["text_cfg"]["heads"],
+                                        layers=teacher_cfg["text_cfg"]["layers"],
+                                        output_dim=teacher_cfg["text_cfg"]["width"])
+        
+        # 3. Load the pre-trained TULIP checkpoint into this instance
+        # checkpoint = torch.load(tulip_checkpoint_path, map_location='cpu')
+        # checkpoint['state_dict'] = {k.replace('module.', ''): v for k, v in checkpoint['state_dict'].items()}
+        # tulip_text_encoder.load_state_dict(checkpoint['state_dict'])
+        # tulip_text_encoder.to(device)
+
+
+        # change the original rope definition with the ntk based rope
+        width = teacher_cfg["text_cfg"]["width"]
+        heads = teacher_cfg["text_cfg"]["heads"]
+        dim = width // heads
+        student_context_length = 77 #TODO: Figure out Why 248? 
+        scaling_factor = 8.
+        rope_text_encoder.transformer.freqs_cis = precompute_freqs_cis_dynamic_ntk_scaling(dim,
+                                                                                    new_end=extended_context_length,
+                                                                                    end=student_context_length,
+                                                                                    scaling_factor=scaling_factor)
+
+        logging.info("Created new TextTransformerRoPE instance with ViT-B-16 dimensions.")
+        logging.info("Performing partial weight loading from standard CLIP text encoder...")
+        # original_text_sd = model.text.state_dict()
+        original_text_sd = model.state_dict()
+
+        # Load these weights. `strict=False` is essential because the attention
+        # layers are different in RoPE and will not have matching keys.
+        incompatible_keys = rope_text_encoder.load_state_dict(original_text_sd, strict=False)
+        logging.info("Partial load complete.")
+        logging.info(f"  -> Missing keys (expected, RoPE specific): {incompatible_keys.missing_keys}")
+        logging.info(f"  -> Unexpected keys (expected, standard attention): {incompatible_keys.unexpected_keys}")
+
+        # 4. Transplant the newly constructed and partially initialized text encoder
+        rope_text_encoder.to(device)
+        model.text = deepcopy(rope_text_encoder)
+        logging.info("Transplanted the reconstructed RoPE text tower into the main model.")
+
+
+
+        # replace the text encoder of the main model with the student model
+        model.token_embedding = deepcopy(rope_text_encoder.token_embedding)
+        model.ln_final = deepcopy(rope_text_encoder.ln_final)
+        model.transformer = deepcopy(rope_text_encoder.transformer)
+        model.attn_mask = deepcopy(rope_text_encoder.attn_mask)
+        model.cls_emb = deepcopy(rope_text_encoder.cls_emb)
+        model.pool_type = deepcopy(rope_text_encoder.pool_type)
+
+        model.encode_text = encode_text.__get__(model, CLIP)
+        logging.info("Performing transplant of TULIP text encoder components...")
+
+
+        tokenizer = get_tokenizer(args.model, context_length=extended_context_length)
+
+        # We want to teach the vision/memory side to speak the fixed TULIP language,
+        # so we stop gradients on every part of the text encoder.
+        logging.info("Freezing the transplanted TULIP text encoder.")
+        
+        #  freeze the main text tower module
+        if hasattr(model, 'text') and model.text is not None:
+            for param in model.text.parameters():
+                param.requires_grad = False
+        
+        # corrected logic for the projection layer
+        if hasattr(model, 'text_projection') and model.text_projection is not None:
+            # Check if it's a Module (like nn.Linear) or just a Parameter
+            if isinstance(model.text_projection, nn.Module):
+                # If it's a module, iterate through its parameters
+                for param in model.text_projection.parameters():
+                    param.requires_grad = False
+            elif isinstance(model.text_projection, nn.Parameter):
+                # If it's already a parameter, just set its requires_grad directly
+                model.text_projection.requires_grad = False
+        
+        logging.info("Text encoder frozen. Only the vision tower will be fine-tuned.")
+
 
     if args.distill:
         # FIXME: currently assumes the model you're distilling from has the same tokenizer & transforms.
@@ -413,7 +606,7 @@ def main(args):
             # this doesn't exist in older PyTorch, arg only added if enabled
             ddp_args['static_graph'] = True
         # This improves performance when you know all parameters are used, which is common in fine-tuning.
-        ddp_args['find_unused_parameters'] = False
+        ddp_args['find_unused_parameters'] = True
 
         # Wrap all models using the same ddp_args for consistency
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], **ddp_args)
@@ -474,7 +667,8 @@ def main(args):
             logging.info(f"=> loaded checkpoint '{args.resume}' (epoch {start_epoch})")
 
     # initialize datasets
-    tokenizer = get_tokenizer(args.model,cache_dir=args.cache_dir )
+    if not args.tulip_text_encoder:
+        tokenizer = get_tokenizer(args.model, cache_dir=args.cache_dir)
     data = get_data(
         args,
         (preprocess_train, preprocess_val),

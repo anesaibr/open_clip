@@ -335,7 +335,6 @@ def train_one_epoch_long_short(model, data, loss, epoch, optimizer, scaler, sche
     batch_time_m = AverageMeter()
     data_time_m = AverageMeter()
     end = time.time()
-    max_len = unwrap_model(model).context_length   # CLIP’s fixed text‐encoder context length
     for i, batch in enumerate(dataloader):
         i_accum = i // args.accum_freq
         step = num_batches_per_epoch * epoch + i_accum
@@ -345,10 +344,33 @@ def train_one_epoch_long_short(model, data, loss, epoch, optimizer, scaler, sche
 
         # images, texts, short_text = batch
         images, texts = batch
-        short_text = torch.stack([
-            tokens_to_first_sentence(t, tokenizer, max_len)
-            for t in texts
-        ], dim=0).to(texts.device)
+        B, L_long = texts.shape
+
+        if args.tulip_text_encoder:
+            short_list = []
+            for t in texts:
+                # 1. Decode to string, grab first sentence
+                raw = tokenizer.decode(t.cpu().numpy())
+                sent = first_sentence_str(raw)
+                # 2. Re-tokenize *to* the long length; this returns a [1, L_long] LongTensor
+                short_ids = tokenizer(sent, context_length=L_long)
+                # 3. Squeeze to [L_long] and move to the right device
+                short_ids = short_ids.squeeze(0).to(device=texts.device)
+                short_list.append(short_ids)
+            # 4. Stack into [B, L_long]
+            short_text = torch.stack(short_list, dim=0)
+        else:
+            max_len = unwrap_model(model).context_length   # CLIP’s fixed text‐encoder context length
+            short_text = torch.stack([
+                tokens_to_first_sentence(t, tokenizer, max_len)
+                for t in texts
+            ], dim=0).to(texts.device)
+            if short_text.size(1) < L_long:
+                pad_id = tokenizer.pad_token_id
+                pad = short_text.new_full((B, L_long - short_text.size(1)), pad_id)
+                short_text = torch.cat([short_text, pad], dim=1)
+            elif short_text.size(1) > L_long:
+                short_text = short_text[:, :L_long]
 
         images = images.to(device=device, dtype=input_dtype, non_blocking=True)
         texts = texts.to(device=device, non_blocking=True)
@@ -358,33 +380,57 @@ def train_one_epoch_long_short(model, data, loss, epoch, optimizer, scaler, sche
         optimizer.zero_grad()
 
         if args.accum_freq == 1:
+            # --- LONG captions forward/backward ---
             with autocast():
-                model_out = model(images, texts)
-                model_out_short = model(images, short_text)
-
-                logit_scale = model_out["logit_scale"]
+                out_long = model(images, texts)
                 if args.distill:
+                    # optionally do distillation head on long only
+                    dist_out = {}
                     with torch.no_grad():
-                        dist_model_out = dist_model(images, texts)
-                    model_out.update({f'dist_{k}': v for k, v in dist_model_out.items()})
-                losses = loss(**model_out, output_dict=True)
-                losses_short = loss(**model_out_short, output_dict=True)
+                        d = dist_model(images, texts)
+                        dist_out = {f"dist_{k}":v for k,v in d.items()}
+                    out_long.update(dist_out)
+                losses_long = loss(**out_long, output_dict=True)
+                loss_long  = sum(losses_long.values())
+            # backprop and free the first graph
+            backward(loss_long, scaler)
 
-                total_loss = sum(losses.values()) + sum(losses_short.values())
-                losses["loss"] = total_loss
+            # --- SHORT captions forward/backward ---
+            with autocast():
+                out_short      = model(images, short_text)
+                losses_short   = loss(**out_short, output_dict=True)
+                loss_short     = sum(losses_short.values())
+            backward(loss_short, scaler)
 
-            backward(total_loss, scaler)
+            losses = {**losses_long, **losses_short}
+            # and the logit_scale used by the model (for the "Logit Scale" column)
+            logit_scale = out_long["logit_scale"]
         else:
             # First, cache the features without any gradient tracking.
             with torch.no_grad():
                 with autocast():
-                    combined_texts = torch.cat([texts, short_text], dim=0)
-                    combined_model_out = model(images, combined_texts)
-                    image_features = combined_model_out['image_features']
-                    long_text_features, short_text_features = combined_model_out['text_features'].chunk(2, dim=0)
-                    logit_scale = combined_model_out['logit_scale']
-                    model_out = dict(image_features=image_features, text_features=long_text_features, logit_scale=logit_scale)
-                    model_out_short = dict(image_features=image_features, text_features=short_text_features, logit_scale=logit_scale)
+                    # combined_texts = torch.cat([texts, short_text], dim=0)
+                    # combined_model_out = model(images, combined_texts)
+                    # image_features = combined_model_out['image_features']
+                    # long_text_features, short_text_features = combined_model_out['text_features'].chunk(2, dim=0)
+                    # logit_scale = combined_model_out['logit_scale']
+                    # model_out = dict(image_features=image_features, text_features=long_text_features, logit_scale=logit_scale)
+                    # model_out_short = dict(image_features=image_features, text_features=short_text_features, logit_scale=logit_scale)
+                    
+                    out_long  = model(images, texts)
+                    out_short = model(images, short_text)
+                    # 3) Pull out the shared image features and per‐caption text features
+                    image_features      = out_long['image_features']
+                    long_text_features  = out_long['text_features']
+                    short_text_features = out_short['text_features']
+                    logit_scale         = out_long['logit_scale']
+                    # 4) Build the two output‐dicts
+                    model_out       = dict(image_features=image_features,
+                                        text_features=long_text_features,
+                                        logit_scale=logit_scale)
+                    model_out_short = dict(image_features=image_features,
+                                        text_features=short_text_features,
+                                        logit_scale=logit_scale)
 
                     for f in ("logit_scale", "logit_bias"):
                         model_out.pop(f, None)
@@ -423,14 +469,35 @@ def train_one_epoch_long_short(model, data, loss, epoch, optimizer, scaler, sche
                 short_text = accum_short_texts[j]
 
                 with autocast():
-                    # model_out = model(images, texts)
-                    combined_texts = torch.cat([texts, short_text], dim=0)
-                    combined_model_out = model(images, combined_texts)
-                    image_features = combined_model_out['image_features']
-                    long_text_features, short_text_features = combined_model_out['text_features'].chunk(2, dim=0)
-                    logit_scale = combined_model_out['logit_scale']
-                    model_out = dict(image_features=image_features, text_features=long_text_features, logit_scale=logit_scale)
-                    model_out_short = dict(image_features=image_features, text_features=short_text_features, logit_scale=logit_scale)
+                    # model_out = model(images, texts) #wascommented out initially
+
+                    # combined_texts = torch.cat([texts, short_text], dim=0)
+                    # combined_model_out = model(images, combined_texts)
+                    # image_features = combined_model_out['image_features']
+                    # long_text_features, short_text_features = combined_model_out['text_features'].chunk(2, dim=0)
+                    # logit_scale = combined_model_out['logit_scale']
+                    # model_out = dict(image_features=image_features, text_features=long_text_features, logit_scale=logit_scale)
+                    # model_out_short = dict(image_features=image_features, text_features=short_text_features, logit_scale=logit_scale)
+                    
+                    # Do two smaller forwards instead of one combined one
+                    out_long  = model(images, texts)
+                    out_short = model(images, short_text)
+    
+                    image_features      = out_long['image_features']
+                    long_text_features  = out_long['text_features']
+                    short_text_features = out_short['text_features']
+                    logit_scale         = out_long['logit_scale']
+    
+                    model_out = dict(
+                        image_features=image_features,
+                        text_features=long_text_features,
+                        logit_scale=logit_scale
+                    )
+                    model_out_short = dict(
+                        image_features=image_features,
+                        text_features=short_text_features,
+                        logit_scale=logit_scale
+                    )
 
                     inputs_no_accum = {}
                     inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")
@@ -807,10 +874,30 @@ def evaluate_long_short_caps(model, data, epoch, args, tb_writer=None, tokenizer
             for i, batch in enumerate(dataloader):
                 # images, texts, short_text = batch
                 images, texts = batch
-                short_text = torch.stack([
+                B, L_long = texts.shape
+        
+                if args.tulip_text_encoder:
+                    # first‐sentence re‐tokenized to the *long* context length
+                    short_list = []
+                    for t in texts:
+                        raw = tokenizer.decode(t.cpu().tolist())
+                        sent = first_sentence_str(raw)
+                        enc = tokenizer(sent, context_length=L_long)  # returns [1, L_long]
+                        short_ids = enc.squeeze(0).to(texts.device)
+                        short_list.append(short_ids)
+                    short_text = torch.stack(short_list, dim=0)
+                else:
+                    # legacy: extract & pad/truncate to L_long
+                    short_text = torch.stack([
                         tokens_to_first_sentence(t, tokenizer, max_len)
                         for t in texts
-                ], dim=0).to(texts.device)
+                    ], dim=0).to(texts.device)
+                    if short_text.size(1) < L_long:
+                        pad_id = tokenizer.eot_token_id
+                        pad = short_text.new_full((B, L_long - short_text.size(1)), pad_id)
+                        short_text = torch.cat([short_text, pad], dim=1)
+                    elif short_text.size(1) > L_long:
+                        short_text = short_text[:, :L_long]
 
                 images = images.to(device=device, dtype=input_dtype, non_blocking=True)
                 texts = texts.to(device=device, non_blocking=True)
