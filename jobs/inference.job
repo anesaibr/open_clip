@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --partition=fatq            # or gpu_a100 (cpu:72)
+#SBATCH --partition=defq            # or gpu_a100 (cpu:72)
 #SBATCH --gres=gpu:1                  # Max GPUs per node (4)
 #SBATCH --job-name=Memory_Eval  # Job name
 #SBATCH --ntasks=1                      # 1 task (total)
@@ -70,19 +70,23 @@ DATA_DIR="/var/scratch/aibrahim/datasets"
 # Uncomment To Evaluate Baseline Model:
     # When wanting to evaluate the standard OpenCLIP model, use the --baseline flag & --pretrained "openai" (example) & --precision amp_bf16 .
     # When wanting to evaluate the FLAIR model, use the --baseline flair & --huggingface-repo-name xiaorui638/flair and one of the following:
-        # --huggingface-model-name flair-cc3m-recap.pt , flair-cc12m-recap.pt, flair-merged30m.pt , flair-yfcc15m-recap.pt
-        # specify  --inference-with-flair argument 
-        # specify --precion amp 
+        # --huggingface-model-name flair-cc3m-recap.pt or flair-cc12m-recap.pt or flair-merged30m.pt or flair-yfcc15m-recap.pt
+        # --precision amp
         # --model ViT-B-16-FLAIR \
         # --huggingface-repo-name "xiaorui638/flair" \
         # --huggingface-model-name "flair-cc3m-recap.pt" \
         # --inference-with-flair \
+        # --name "eval-baseline-flair-cc3m" \
+
 
 
 torchrun --nproc_per_node 1 -m eval_run -- \
-    --model ViT-B-16 \
+    --model ViT-B-16-FLAIR \
     --pretrained "openai" \
-    --baseline  \
+    --baseline flair \
+    --huggingface-repo-name "xiaorui638/flair" \
+    --huggingface-model-name "flair-cc3m-recap.pt" \
+    --inference-with-flair \
     \
     --coco-data-root-dir  ${DATA_DIR}/coco \
     --flickr-data-root-dir  ${DATA_DIR}/flickr30k-images \
@@ -99,7 +103,7 @@ torchrun --nproc_per_node 1 -m eval_run -- \
     --retrieval-dci \
     \
     --batch-size 128 \
-    --precision amp_bf16 \
+    --precision amp \
     --workers 25 \
     \
     --name "eval-baseline-flair-cc3m" \
@@ -109,11 +113,12 @@ torchrun --nproc_per_node 1 -m eval_run -- \
 
 
 # Uncomment To Evaluate Memory-Augmented Model 
-# torchrun --nproc_per_node 1 -m eval_memory -- \
+# torchrun --nproc_per_node 1 -m eval_run -- \
 #     --model ViT-B-16 \
 #     --pretrained "openai" \
-#     --distilled_model_path "/var/scratch/aibrahim/logs/Finetuning/2025_07_15-11_52_38-finetune_memory_ViT-B-16lr_1e-05-b_32-j_8-p_amp_bf16-loss_cosine/checkpoints/epoch_1.pt" \
+#     --distilled_model_path "/var/scratch/aibrahim/logs/2025_07_21-09_31_40-finetune_memory_ViT-B-16lr_1e-05-b_32-j_8-p_amp_bf16-loss_cosine/checkpoints/epoch_2.pt" \
 #     --use-memory \
+#     --tulip-text-encoder \
 #     \
 #     --coco-data-root-dir  ${DATA_DIR}/coco \
 #     --flickr-data-root-dir  ${DATA_DIR}/flickr30k-images \
