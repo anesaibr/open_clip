@@ -384,8 +384,11 @@ def retrieval_on_split(keyword, model, txt_loader, img_loader, img2txt_dict, txt
                     text_features = F.normalize(global_text_token, dim=-1)
                     all_text_tokens.append(global_text_token.squeeze(1))  # GPU
                     all_local_text_tokens.append(local_text_tokens)  # GPU
+                elif args.use_longclip:
+                    # LongCLIP's encode_text does not accept 'normalize' and always returns normalized features.
+                    text_features = unwrap_model(model).encode_text(texts)
                 else:
-                    text_features = unwrap_model(model).encode_text(texts, normalize=True)
+                    text_features = unwrap_model(model).encode_text(texts, normalize=True) # This is the default path for standard OpenCLIP models.
 
                 all_text_features.append(text_features.detach().cpu())  # cpu list of N, each of shape (B, D)
                 all_cap_ids.append(cap_id.detach().cpu())
@@ -406,6 +409,7 @@ def retrieval_on_split(keyword, model, txt_loader, img_loader, img2txt_dict, txt
                                                                                     all_text_features_tensor, device,
                                                                                     input_dtype,
                                                                                     autocast,
+                                                                                    args,
                                                                                     mode='original_clip')
 
         new_img2txt_dict, new_txt2img_dict = remap_indices(merged_img_ids=img_ids, cap_ids=cap_ids,
@@ -442,7 +446,7 @@ def retrieval_on_split(keyword, model, txt_loader, img_loader, img2txt_dict, txt
 
 
 def compute_similarity_scores_original_clip(model, img_loader, all_text_features_tensor, device, input_dtype,
-                                            autocast, mode='original_clip'):
+                                            autocast, args, mode='original_clip'):
     all_image_features = []
     all_img_ids = []
 
@@ -453,7 +457,11 @@ def compute_similarity_scores_original_clip(model, img_loader, all_text_features
      
         with autocast():
             if mode == 'original_clip':
-                image_features = unwrap_model(model).encode_image(images, normalize=True)
+                if args.use_longclip:
+                    # LongCLIP's encode_image does not accept 'normalize' and always returns normalized features.
+                    image_features = unwrap_model(model).encode_image(images)
+                else:
+                    image_features = unwrap_model(model).encode_image(images, normalize=True)
             elif mode == 'imgcon':
                 _, local_image_tokens = unwrap_model(model).encode_image(images)
                 local_image_tokens = unwrap_model(model).image_post(local_image_tokens)

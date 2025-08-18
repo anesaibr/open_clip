@@ -734,6 +734,7 @@ class FlickrImageDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         return image, img_id
+        # return image, img_id,img_path
 
 
 class COCOTextDataset(Dataset):
@@ -935,6 +936,7 @@ class IIWImageDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         return image, img_id
+        # return image, img_id, img_path
 
 
 class DCITextDataset(Dataset):
@@ -996,6 +998,7 @@ class DCIImageDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         return image, img_id
+        # return image, img_id,img_path
 
 
 class Urban1kTextDataset(Dataset):
@@ -1129,6 +1132,7 @@ class COCOImageDataset(Dataset):
         if self.transform:
             image = self.transform(image)
         return image, img_id
+        # return image, img_id, img_path
 
 
 def get_retrieval_coco_dataset(args, preprocess_fn, tokenizer=None, output_dict=False):
