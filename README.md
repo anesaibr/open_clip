@@ -1,4 +1,4 @@
-# Memory Augmented - OpenCLIP Codebase
+# Memory Augmented CLIP
 
 This is the official repository of my Master's Thesis Project : ***Fine-grained image understanding with VLMs***
 
@@ -20,87 +20,168 @@ for future advancements in developing more comprehensive and efficient models fo
 image understanding.
 ## Approach
 
-| ![CLIP](https://raw.githubusercontent.com/mlfoundations/open_clip/main/docs/CLIP.png) |
+| ![Diagram of my approach](./assets/KnowledgeDistillation_2.png) |
 |:--:|
-| Image Credit: https://github.com/openai/CLIP |
 
 
 ## Data
 
-To download datasets as webdataset, we recommend [img2dataset](https://github.com/rom1504/img2dataset).
+To download datasets as webdataset, we recommend [img2dataset](https://github.com/rom1504/img2dataset). We use [ShareGPT4V](https://github.com/ShareGPT4Omni/ShareGPT4V) dataset for our model's training.
 
-## Training CLIP
+## Training our model 
 
 ### Install
 
 We advise you first create a virtual environment with:
 
 ```
-python3 -m venv .env
-source .env/bin/activate
+python3.11 -m venv memory_clip
 pip install -U pip
 ```
 
 You can then install openclip for training with `pip install 'open_clip_torch[training]'`.
+Moreover, you can then install the necessary dependencies via the following SLURM job file : 
 
+```
+sbatch install_env.job
+```
 
-### Sample single-process running code:
+#### Multi-Node 
+
+We make use of `torchrun` to launch distributed jobs. The following launches
+a job on a node of 2 GPUs. To utlimately activate our memory-augmented model, the following command is 
+responsible `--use-memory` for successfully differentiating a standard CLIP model from ours: 
 
 ```bash
-python -m open_clip_train.main \
+cd open_clip/src
+torchrun --nproc_per_node 2 -m src.open_clip_train.main -- \
     --save-frequency 1 \
-    --zeroshot-frequency 1 \
-    --report-to tensorboard \
-    --train-data="/path/to/train_data.csv"  \
-    --val-data="/path/to/validation_data.csv"  \
-    --csv-img-key filepath \
-    --csv-caption-key title \
-    --imagenet-val=/path/to/imagenet/root/val/ \
-    --warmup 10000 \
-    --batch-size=128 \
-    --lr=1e-3 \
+    --train-data="/var/scratch/aibrahim/ShareGPT4V/wds_sharegpt4v/train/{000000..000125}.tar"\
+    --val-data="/var/scratch/aibrahim/ShareGPT4V/wds_sharegpt4v/val/000000.tar"   \
+    --dataset-type=webdataset \
+    --train-num-samples 1245902  \
+    --val-num-samples 1000 \
+    --use-memory \
+    --warmup 1000 \
+    --batch-size=20  \
+    --accum-freq 4 \
+    --lr=5e-4 \
     --wd=0.1 \
-    --epochs=30 \
+    --epochs=10 \
+    --workers=4 \
+    --grad-checkpointing \
+    --model ViT-B-16 \
+    --precision amp_bf16 \
+    --pretrained "openai" \
+    --report-to wandb \
+    --log-every-n-steps 100 
+```
+
+As seen in the 'Approach' section above, the training process of our model consists of a distillation approach. The first stage, an initial knowledge distillation phase, aims at aligning the memory-augmented encoder with pre-trained vision encoder. More specifically the following job file `jobs/open_clip_distill.job` contains the necessary and in-depth commands for efficiently transferring the global alignment and architecture of a pre-trained model to a leaner model with an encoder infused with memory-layers: 
+
+```
+cd open_clip/src
+torchrun --nproc_per_node 4 -m src.open_clip_train.main_distill_memory -- \
+     --save-frequency 1 \
+     --train-data="/var/scratch/aibrahim/ShareGPT4V/wds_sharegpt4v/train/{000000..000125}.tar" \
+     --val-data="/var/scratch/aibrahim/ShareGPT4V/wds_sharegpt4v/val/000000.tar"  \
+     --train-num-samples 1245902 \
+     --val-num-samples 1000 \
+     --val-frequency 1 \
+     --dataset-type=webdataset \
+     --early_stop_patience 3 \
+     --early_stop_min_delta 0.005 \
+     --dataset_name "sharegpt4v" \
+     --use-memory \
+     --warmup 1000 \
+     --batch-size=20  \
+     --accum-freq 4 \
+     --lr=5e-4 \
+     --wd=0.1 \
+     --epochs=40 \
+     --workers=2 \
+     --grad-checkpointing \
+     --model ViT-B-16 \
+     --precision amp_bf16 \
+     --pretrained "openai" \
+     --report-to wandb \
+     --loss-type "cosine" \
+     --log-every-n-steps 100 
+```
+
+After distilling knowledge from a larger model to a leaner one, the distillation phase is followed by a contrastive fine-tuning phase to adapt the model for specific downstream tasks. More commands can be found in `jobs/open_clip_finetune.job`:
+
+```
+cd open_clip/src
+torchrun --nproc_per_node 4 -m src.open_clip_train.main_vision_context_finetune -- \
+    --train-data="/var/scratch/aibrahim/ShareGPT4V/wds_sharegpt4v/train/{000000..000125}.tar" \
+    --train-num-samples 1245902 \
+    --val-data="/var/scratch/aibrahim/ShareGPT4V/wds_sharegpt4v/val/000000.tar"  \
+    --val-num-samples 1000 \
+    --dataset-type=webdataset \
+    --dataset_name "sharegpt4v" \
+    --val-frequency 1 \
+    --save-frequency 1 \
+    \
+    --grad-checkpointing \
+    --model ViT-B-16 \
+    --precision amp_bf16 \
+    --pretrained "openai" \
+    \
+    --use-memory \
+    --warmup 1000 \
+    --batch-size=32   \
+    --accum-freq 2 \
+    --lr=1e-5 \
+    --wd=0.1 \
+    --epochs=10 \
     --workers=8 \
-    --model RN50
+    \
+    --student-model '' \
+    --report-to wandb \
+    --wandb-project-name "" \
+    --loss-type "cosine" \
+    --logs="" \
+    --log-every-n-steps 100 
 ```
 
+## Evaluation
 
-#### Single-Node
+Lastly, to evaluate our model on cross-modal retrieval tasks run the following command below. For further potential insights and augmentations of inference, the slurm job stored in `jobs/inference.job` contains more detailed commands:
 
-We make use of `torchrun` to launch distributed jobs. The following launches a
-a job on a node of 4 GPUs:
-
-```bash
-cd open_clip/src
-torchrun --nproc_per_node 4 -m open_clip_train.main \
-    --train-data '/data/cc12m/cc12m-train-{0000..2175}.tar' \
-    --train-num-samples 10968539 \
-    --dataset-type webdataset \
-    --batch-size 320 \
-    --precision amp \
-    --workers 4 \
-    --imagenet-val /data/imagenet/validation/
 ```
-#### Multi-Node
-
-The same script above works, so long as users include information about the number
-of nodes and host node.
-
-```bash
-cd open_clip/src
-torchrun --nproc_per_node=4 \
-    --rdzv_endpoint=$HOSTE_NODE_ADDR \
-    -m open_clip_train.main \
-    --train-data '/data/cc12m/cc12m-train-{0000..2175}.tar' \
-    --train-num-samples 10968539 \
-    --dataset-type webdataset \
-    --batch-size 320 \
-    --precision amp \
-    --workers 4 \
-    --imagenet-val /data/imagenet/validation/
+cd open_clip
+torchrun --nproc_per_node 1 -m eval_run -- \
+    --model ViT-B-16 \
+    --pretrained "openai" \
+    --distilled_model_path "" \
+    --use-memory \
+    \
+    --coco-data-root-dir  ${DATA_DIR}/coco \
+    --flickr-data-root-dir  ${DATA_DIR}/flickr30k-images \
+    --iiw-retrieval-dir  ${DATA_DIR}/imageinwords/ \
+    --docci-retrieval-dir  ${DATA_DIR}/docci \
+    --urban-1k-retrieval-dir  ${DATA_DIR}/Urban1k \
+    --dci-retrieval-dir  ${DATA_DIR}/dci \
+    \
+    --retrieval-flickr \
+    --retrieval-coco \
+    --retrieval-docci \
+    --retrieval-urban-1k \
+    --retrieval-iiw \
+    --retrieval-dci \
+    \
+    --batch-size 128 \
+    --precision amp_bf16 \
+    --workers 25 \
+    \
+    --name "" \
+    --logs "" \
+    --report-to json wandb \
+    --wandb-project-name ""
 ```
+
 
 ## Acknowledgements 
 
-Current development of this repository is based on [CLIP](https://github.com/openai/CLIP). Moreover, several training, distillation and evaluation code has relied on the existing the work of [TULIP](https://github.com/ivonajdenkoska/tulip) & [FLAIR](https://github.com/ExplainableML/flair)
+Current development of this repository is based on [CLIP](https://github.com/openai/CLIP). Moreover, several training, distillation and evaluation code has relied on the existing the work of [TULIP](https://github.com/ivonajdenkoska/tulip) , [FLAIR](https://github.com/ExplainableML/flair) & [SCLIP](https://github.com/wangf3014/SCLIP)
