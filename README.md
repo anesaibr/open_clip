@@ -20,8 +20,13 @@ for future advancements in developing more comprehensive and efficient models fo
 image understanding.
 ## Approach
 
-| ![Diagram of my approach](./assets/KnowledgeDistillation_2.png) |
+| Knowledge Distillation |
 |:--:|
+| ![Knowledge Distillation](./assets/KnowledgeDistillation_2.png) <br> *Fig 1. A diagram showing the overall knowledge distillation process.* |
+
+| Memory Layer |
+|:--:|
+| ![Memory Layer](./assets/MemoryLayer.png) <br> *Fig 2. A detailed look at the Memory Layer architecture.* |
 
 
 ## Data
